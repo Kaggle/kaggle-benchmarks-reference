@@ -1,0 +1,58 @@
+schema_version = "1.4"
+
+[task]
+name = "lab/compare-closing-checklist-against-ma-agreement"
+version = "1.0.0"
+description = "Compare a closing checklist against an M&A asset purchase agreement and produce a categorized, severity-rated deviation report."
+keywords = [
+    "legal",
+    "corporate-ma",
+    "document-comparison",
+    "deviation-analysis",
+]
+
+[metadata]
+practice_area = "corporate-ma"
+work_type = "review"
+source = "https://github.com/harveyai/harvey-labs"
+source_commit = "55510f0e609ffa5cf6f5df17d9a813ce4bb33d0c"
+license = "MIT"
+n_criteria = 38
+scoring = "all-pass"
+
+# Upstream runs the agent sandbox with `docker --network=none`: the benchmark
+# is closed-universe, and a task solved by searching the web is not the task.
+# That still holds here, because the agent process itself runs on the host and
+# reaches ModelProxy from there -- only the container it drives is cut off.
+[agent]
+timeout_sec = 3600.0
+network_mode = "no-network"
+
+# The verifier is the exception: its LLM-as-judge runs inside the container and
+# needs egress to ModelProxy. Harbor's Linux Docker environment can switch
+# policy between phases, so the agent phase stays sealed.
+[verifier]
+timeout_sec = 1800.0
+network_mode = "allowlist"
+allowed_hosts = ["mp-staging.kaggle.net", "mp.kaggle.net"]
+
+[environment]
+build_timeout_sec = 1800.0
+cpus = 2
+memory_mb = 2048
+storage_mb = 10240
+gpus = 0
+mcp_servers = []
+network_mode = "no-network"
+
+# The verifier calls ModelProxy to run the LLM-as-judge rubric. Credentials are
+# templated from the host environment; the base URL defaults to staging.
+[verifier.env]
+MODEL_PROXY_API_KEY = "${MODEL_PROXY_API_KEY}"
+MODEL_PROXY_BASE_URL = "${MODEL_PROXY_BASE_URL:-https://mp-staging.kaggle.net/models}"
+JUDGE_MODEL = "${LAB_JUDGE_MODEL:-claude-sonnet-4-6}"
+JUDGE_PARALLEL = "${LAB_JUDGE_PARALLEL:-6}"
+
+[environment.env]
+
+[solution.env]

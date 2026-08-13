@@ -1,0 +1,41 @@
+# Harbor job config for the Harvey LAB port.
+#
+# Run with:
+#   harbor run -c config.yaml
+#
+# Requires MODEL_PROXY_API_KEY and MODEL_PROXY_BASE_URL in the environment
+# (see .env). Both the agent and the verifier reach models only through
+# Kaggle's ModelProxy.
+
+job_name: lab
+jobs_dir: jobs
+n_attempts: 1
+n_concurrent_trials: 4
+timeout_multiplier: 1.0
+
+orchestrator:
+  type: local
+  n_concurrent_trials: 4
+  quiet: false
+
+environment:
+  type: docker
+  force_build: false
+  delete: true
+
+agents:
+  # The ported LAB harness. `import_path` resolves against the repo root,
+  # which must be on PYTHONPATH; Kaggle's Harbor entrypoint adds it
+  # automatically for custom-import agents. Locally:
+  #   PYTHONPATH=$PWD harbor run -c config.yaml
+  - import_path: agents.lab_harness:LABHarnessAgent
+    model_name: anthropic/claude-sonnet-4-6
+
+datasets:
+  - path: tasks
+
+metrics:
+  # Pass@1 across tasks: the mean of per-task all-pass scores.
+  - type: uv-script
+    kwargs:
+      script_path: metrics/metric.py

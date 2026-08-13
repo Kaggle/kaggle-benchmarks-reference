@@ -1,0 +1,67 @@
+Harvey's Legal Agent Benchmark (LAB) — Kaggle / Harbor port
+=========================================================
+
+This directory is a derivative work of Harvey's Legal Agent Benchmark (LAB):
+
+    https://github.com/harveyai/harvey-labs
+    Copyright (c) 2026 Harvey AI
+    Licensed under the MIT License (see ./LICENSE)
+
+The upstream project is the original source of the benchmark tasks, the agent
+scaffolding, the rubric criteria, and the evaluation methodology. This port
+adapts that work to run on Kaggle via the Harbor framework
+(https://github.com/laude-institute/harbor). Main architectural changes:
+replacing `podman` sandbox with Harbor-managed containers and routing all
+model traffic through Kaggle's ModelProxy instead of vendor APIs.
+
+Upstream reference commit: 55510f0e609ffa5cf6f5df17d9a813ce4bb33d0c
+
+
+Verbatim copies from harvey-labs (MIT, (c) 2026 Harvey AI)
+----------------------------------------------------------
+
+    LICENSE
+        <- LICENSE
+
+    agents/lab_harness/assets/system_prompt.md
+        <- harness/system_prompt.md
+
+    agents/lab_harness/assets/skills/{docx,pptx,xlsx}/
+        <- harness/skills/{docx,pptx,xlsx}/
+
+    tasks/**/tests/rubric_criterion.txt
+        <- evaluation/prompts/rubric_criterion.txt
+
+    tasks/**/task.json
+        <- the `instructions` field of the same task.json
+        is used for tasks/**/instruction.md (Harbor format)
+
+    tasks/**/environment/documents/
+
+    tasks/**/environment/parse_doc.py
+        <- sandbox/parsers/parse_doc.py
+
+
+Derived / reimplemented from harvey-labs
+-----------------------------------------
+
+These files are new code written for the Harbor port, but their behavior is
+deliberately modeled on the upstream implementation so that scores remain
+comparable to any published Harvey LAB results:
+
+    agents/lab_harness/agent.py    <- harness/run.py (prompt assembly, run wiring)
+    agents/lab_harness/loop.py     <- harness/agent_loop.py
+    agents/lab_harness/tools.py    <- harness/tools.py
+    agents/lab_harness/adapters/   <- harness/adapters/
+    tasks/**/tests/judge.py           <- evaluation/judge.py, evaluation/scoring.py
+    tasks/**/environment/Dockerfile   <- sandbox/Dockerfile
+
+Known intentional deviations from upstream are documented in README.md.
+
+
+Kaggle-authored additions
+--------------------------
+
+Files in this directory that are not copied from or derived from harvey-labs
+are contributed by Google LLC under the Apache License, Version 2.0, matching
+the license of the containing repository (see ../LICENSE).

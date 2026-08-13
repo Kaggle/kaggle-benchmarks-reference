@@ -1,0 +1,84 @@
+# Task environment for the Harvey LAB Harbor port.
+#
+# Derived from harvey-labs sandbox/Dockerfile (MIT, (c) 2026 Harvey AI):
+# https://github.com/harveyai/harvey-labs/blob/main/sandbox/Dockerfile
+# (see NOTICE for reference commit)
+#
+# Differences from upstream:
+#   - No CMD; Harbor manages the container lifecycle.
+#   - Task documents are baked in rather than bind-mounted, because Harbor's
+#     docker build context is the `environment/` directory.
+#   - `httpx` is added for the verifier's judge, so it can reach ModelProxy
+#     without installing anything at verify time.
+#
+# Every apt/pip/npm package below is load-bearing: pandoc drives .docx parsing
+# for both the agent's `read` tool and the judge's deliverable extraction, and
+# the docx/pptx/xlsx libraries back the skill scripts the agent uses to produce
+# binary deliverables.
+
+FROM python:3.12-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# System tools the agent reaches for via `bash`.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        coreutils \
+        curl \
+        file \
+        findutils \
+        gawk \
+        gcc \
+        g++ \
+        git \
+        grep \
+        procps \
+        jq \
+        libreoffice \
+        nodejs \
+        npm \
+        pandoc \
+        poppler-utils \
+        ripgrep \
+        sed \
+        tesseract-ocr \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+        defusedxml \
+        diff-match-patch \
+        docxtpl \
+        httpx \
+        lxml \
+        markitdown \
+        openpyxl \
+        pandas \
+        pdf2image \
+        pdfplumber \
+        pillow \
+        pypdf \
+        python-docx \
+        python-pptx
+
+# JS document libraries the agent uses for .docx / .pptx generation.
+RUN npm install -g docx pptxgenjs && \
+    NODE_PATH_VAL=$(npm root -g) && \
+    echo "export NODE_PATH=${NODE_PATH_VAL}" >> /etc/profile.d/node-path.sh
+ENV NODE_PATH=/usr/local/lib/node_modules
+
+# Document parser. The agent's `read` tool shells out to this for binary
+# formats so that .docx reaches the model as pandoc markdown, preserving the
+# section numbering and table structure that many rubric criteria depend on.
+COPY parse_doc.py /usr/local/bin/parse-doc
+RUN chmod +x /usr/local/bin/parse-doc
+
+# Workspace layout mirrors the upstream sandbox: documents/ is the read-only
+# input set, output/ is where deliverables land.
+RUN mkdir -p /workspace/documents /workspace/output
+COPY documents/ /workspace/documents/
+RUN chmod -R a-w /workspace/documents
+
+WORKDIR /workspace

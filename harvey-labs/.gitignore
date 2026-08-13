@@ -1,0 +1,9 @@
+# Harbor writes run output here (jobs_dir in config.yaml).
+jobs/
+
+# Ad-hoc run output from `harbor run -o results/`.
+results/
+
+.env
+__pycache__/
+*.pyc
