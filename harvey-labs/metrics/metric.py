@@ -20,7 +20,17 @@
 
 Harvey LAB reports Pass@1: the mean of per-task all-pass scores, where each
 task scores 1.0 only if every rubric criterion passed. Since the verifier has
-already collapsed each task to 0.0 or 1.0, Pass@1 is just the mean.
+already collapsed each task to a score, Pass@1 is just the mean.
+
+That per-task score is 0.0 or 1.0 under the default single judge. Under the
+opt-in dual-judge profile each judge collapses to its own all-pass verdict and
+the task score is their mean, so it can also be 0.5. Two consequences for the
+numbers here: `n_tasks_passed` counts only tasks every judge passed, and
+`n_criteria`/`n_passed` count criterion *verdicts*, so a dual-graded task
+contributes twice its rubric size.
+
+A job should therefore not mix single and dual judge modes if `criterion_pass_rate`
+is to stay comparable across all of its trials.
 
 Reads the rewards JSONL Harbor produces (one object per trial) and writes a
 JSON object of aggregate metrics.
@@ -35,6 +45,8 @@ def main(input_path: Path, output_path: Path) -> None:
     scores: list[float] = []
     n_criteria_total = 0
     n_criteria_passed = 0
+    n_judge_errors = 0
+    n_trials_judge_errored = 0
 
     for line in input_path.read_text().splitlines():
         if not line.strip():
@@ -63,6 +75,11 @@ def main(input_path: Path, output_path: Path) -> None:
         n_criteria_total += int(reward.get("n_criteria", 0) or 0)
         n_criteria_passed += int(reward.get("n_passed", 0) or 0)
 
+        errors = int(reward.get("n_judge_errors", 0) or 0)
+        n_judge_errors += errors
+        if errors:
+            n_trials_judge_errored += 1
+
     n_tasks = len(scores)
     pass_at_1 = sum(scores) / n_tasks if n_tasks else 0.0
 
@@ -70,6 +87,14 @@ def main(input_path: Path, output_path: Path) -> None:
         "pass_at_1": pass_at_1,
         "n_tasks": n_tasks,
         "n_tasks_passed": sum(1 for s in scores if s >= 1.0),
+        # Only reachable under dual grading: the judges disagreed on whether
+        # the task passed.
+        "n_tasks_partial": sum(1 for s in scores if 0.0 < s < 1.0),
+        # A criterion whose judge call failed is scored as a failure.
+        # This represents how much of the score to distrust.
+        # Both below should be 0 on a healthy run.
+        "n_judge_errors": n_judge_errors,
+        "n_trials_judge_errored": n_trials_judge_errored,
     }
 
     # Criterion-level pass rate is not the headline number, but it separates

@@ -19,7 +19,8 @@ OUTPUT_DIR=/workspace/output
 
 mkdir -p "$VERIFIER_DIR"
 
-# Always leave a reward behind. Overwritten on success by judge.py.
+# Always leave a reward behind. Overwritten on success by judge.py; keep the
+# keys in lockstep with that file's build_reward().
 write_zero_reward() {
   if [ ! -s "$REWARD_JSON" ]; then
     cat > "$REWARD_JSON" <<'EOF'
@@ -28,7 +29,8 @@ write_zero_reward() {
   "score": 0.0,
   "n_criteria": 0,
   "n_passed": 0,
-  "judge_latency_ms": 0.0
+  "judge_latency_ms": 0.0,
+  "n_judge_errors": 0
 }
 EOF
   fi
@@ -54,7 +56,12 @@ python3 "$TESTS_DIR/judge.py" \
   --scores-json "$SCORES_JSON"
 judge_status=$?
 
-if [ "$judge_status" -ne 0 ]; then
+if [ "$judge_status" -eq 3 ]; then
+  # A judge that never answered. Its criteria would all read as failures, so
+  # judge.py refuses to write a score; the trap's zero reward stands, which
+  # reads as an infrastructure problem rather than a graded task.
+  echo "A configured judge was unreachable; no score written. See above." >&2
+elif [ "$judge_status" -ne 0 ]; then
   echo "Judge failed with exit code $judge_status; scoring 0." >&2
 fi
 

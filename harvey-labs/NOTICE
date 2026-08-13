@@ -53,7 +53,11 @@ comparable to any published Harvey LAB results:
     agents/lab_harness/loop.py     <- harness/agent_loop.py
     agents/lab_harness/tools.py    <- harness/tools.py
     agents/lab_harness/adapters/   <- harness/adapters/
-    tasks/**/tests/judge.py           <- evaluation/judge.py, evaluation/scoring.py
+    tasks/**/tests/judge.py           <- evaluation/judge.py, evaluation/scoring.py,
+                                         evaluation/run_eval.py (dual-judge
+                                         aggregation, JUDGE_MODELS),
+                                         evaluation/report.py (strict-AND merged
+                                         per-criterion view)
     tasks/**/environment/Dockerfile   <- sandbox/Dockerfile
 
 Known intentional deviations from upstream are documented in README.md.

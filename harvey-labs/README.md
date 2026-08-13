@@ -22,6 +22,47 @@ of 38 discrepancies scores the same as one that catches none. This models the
 reality of legal work, where meeting 9/10 criteria is not 90% useful; it's
 wrong.
 
+### Dual judges (opt-in)
+
+We can grade with two judges and average them. Add `LAB_JUDGE_MODELS` to
+your .env file, using a comma-separated list:
+
+Example:
+```
+LAB_JUDGE_MODELS="claude-sonnet-4-6,openai/gpt-5.6-sol"
+```
+
+Each judge grades all 38 criteria independently and collapses to its _own_
+all-pass verdict; the task reward is the mean of those verdicts. So with two
+judges the reward is `0.0`, `0.5`, or `1.0`, and a `0.5` means the judges
+disagreed about whether the task passed at all. This is upstream's
+`dual_all_pass_rate`. The mean criterion fraction is also recorded, as
+`dual_criterion_pass`, but it is a diagnostic and not the score.
+
+One judge is the default.
+
+`reward.json` carries:
+
+| Key                                                                        | Single | Dual                                |
+| -------------------------------------------------------------------------- | ------ | ------------------------------------- |
+| `reward`, `score`                                                          | 0/1    | 0/0.5/1                             |
+| `n_criteria`, `n_passed`                                                   | ✓      | pooled across judges (76, not 38)   |
+| `judge_latency_ms`, `n_judge_errors`                                       | ✓      | ✓                                   |
+| `n_judges`, `dual_all_pass_rate`, `dual_criterion_pass`, `all_pass_strict` | —      | ✓                                   |
+| `judge_<i>_{all_pass,n_passed,n_errors,latency_ms}`                        | —      | ✓                                   |
+
+`n_criteria` counts criterion _verdicts_, so a dual-graded task contributes
+twice its rubric size and `criterion_pass_rate` stays the mean pass rate.
+
+Because the judges are graded independently, a judge that is simply _broken_
+would score every criterion as a failure and quietly halve the reward.
+
+Two guards prevent that:
+  - In dual mode each judge is probed once before grading starts
+  - A judge that produces no successful verdict actoss all criteria aborts the run without writing a score.
+  
+The verifier leaves a zero reward behind, which reads as an infrastructure failure rather than a graded task.
+
 ## Layout
 
 ```
@@ -116,8 +157,17 @@ Set on the agent via `--ae KEY=VALUE`:
 | `LAB_REASONING_EFFORT` | unset   | Enables adaptive thinking on models that support it |
 
 Verifier-side, via the host environment (templated in `task.toml`):
-`LAB_JUDGE_MODEL` (default `claude-sonnet-4-6`) and `LAB_JUDGE_PARALLEL`
-(default `6`).
+
+| Variable             | Default             | Effect                                                     |
+| -------------------- | ------------------- | ---------------------------------------------------------- |
+| `LAB_JUDGE_MODEL`    | `claude-sonnet-4-6` | The single judge                                            |
+| `LAB_JUDGE_MODELS`   | unset               | Comma-separated list; two or more enables dual grading      |
+| `LAB_JUDGE_PARALLEL` | `6`                 | Concurrent judge calls **per judge**                        |
+
+`LAB_JUDGE_PARALLEL` is per judge, so dual mode issues up to `2 ×` the
+concurrent calls rather than taking twice as long. A model id may be prefixed
+with its provider (`openai/gpt-5.6-sol`); a bare one is inferred the same way
+the agent's adapters do.
 
 ## Agent
 
@@ -131,9 +181,14 @@ when the model stops calling tools, capped at 200 turns.
 It runs as a Harbor _external_ agent: the loop executes on the host and drives
 the container through `environment.exec()`.
 
-Only Anthropic models are wired up today. `adapters/__init__.py` is the seam for
-the rest: OpenAI (`/openapi`) and Google (`/gemini`) already have their
-ModelProxy paths mapped and need only an adapter class each.
+Only Anthropic models are wired up for the _agent_ today.
+`adapters/__init__.py` is the seam for the rest: OpenAI (`/openapi`) and Google
+(`/gemini`) already have their ModelProxy paths mapped and need only an adapter
+class each.
+
+The _judge_ speaks both Anthropic and OpenAI, but through its own seam in
+`tests/judge.py`, which deliberately shares no code with these adapters: Harbor
+uploads `tests/` into the container by itself, so `judge.py` has to stand alone.
 
 ## Intentional deviations from upstream
 
@@ -168,15 +223,32 @@ something different, and why:
    reproducibility than it recovers. Unmatched deliverables are graded as
    missing.
 
-6. **Judge errors score as failures.** If a criterion's judge call cannot be
-   completed after its retries, that criterion is recorded as `fail` with the
-   error in its reasoning, rather than aborting the run. Under all-pass grading
-   this yields `0.0` — the conservative outcome.
+6. **Judge errors score as failures, but are counted.** If a criterion's judge
+   call cannot be completed after its retries, that criterion is recorded as
+   `fail` with the error in its reasoning, rather than aborting the run. Under
+   all-pass grading this yields `0.0` — the conservative outcome. The port adds
+   bookkeeping, and carries `error: true` in `scores.json`, the summary prints
+   it as `ERROR C-0xx` instead of folding it into the `FAIL` list, and
+   `reward.json` carries `n_judge_errors` in both modes so a `0.0` caused by a
+   flaky backend is distinguishable from a `0.0` the agent earned. A judge that fails *every* criterion is treated as an infrastructure failure, not a score — see the dual judge guards under [Scoring](#dual-judges-opt-in).
 
 7. **`claude-opus-5` added to the max-output table.** It postdates upstream's
    table; without an entry it would fall through to the 16k default and be
    capped at an eighth of its real output budget. Every model upstream lists
    keeps its upstream value.
+
+8. **Dual judges share one extraction pass and one thread pool.**
+   The original benchmark implementation grades with one judge, then the other, re-extracting every deliverable for each criterion both times. Here the deliverable text is extracted once, memoized on `(filename, track_changes)`, and both judges are scheduled into a single pool. Nothing the judge sees changes — the prompts are byte-identical — but dual grading costs roughly one single run's wall clock rather than two, which matters against the verifier's 1800s timeout. The shared extraction also guarantees the two judges grade the same bytes, which is a precondition for their disagreement to mean anything.
+
+9. **No `temperature` on the OpenAI judge path.**
+   The original benchmark implementation sends `0.0` to both judges. ModelProxy rejects the parameter outright for gpt-5.x (`400: not supported with this model`), so the OpenAI judge omits it. The consequence is worth stating plainly: that judge is not temperature-pinned and so may not be deterministic
+   run to run. Anthropic judges still send a temperature of `0.0`.
+
+10. **Judge model ids are sent verbatim.**
+    The provider is inferred the way `adapters/__init__.py` infers it, but the prefix is _not_ stripped: `openai/gpt-5.6-sol` is routed to `/openapi` and sent as `openai/gpt-5.6-sol`. That keeps the default single-judge request a literal byte-for-byte no-op and avoids depending on how each route happens to treat a bare id. `split_model_name`'s stripping return contract is the one thing in that module deliberately not ported from the original implementation.
+
+11. **`gpt-5.6-sol` substitutes for upstream's `gpt-5.5`.**
+    The original benchmark implementation's second default judge is unavailable through ModelProxy (b/545349532). The API shape is the same (OpenAI Responses), so the method is upstream's; the model is not. A dual score from this port is methodologically equivalent to gpt-5.5. We plan to change the judge to gpt-5.5 once the ModelProxy issue is addressed.
 
 Note that shell commands are still wrapped exactly as upstream wraps them —
 `timeout --kill-after=2 <n> bash -lc …`, with `WORKSPACE_DIR`, `DOCUMENTS_DIR`,
@@ -189,16 +261,15 @@ to the workspace by those variable names, the login shell is what puts
 ### Verified fidelity
 
 Re-scoring upstream's own reference deliverable for this task with this port's
-judge reproduces the upstream result exactly: **36/38 criteria passed**, with
-`C-014` and `C-033` failing, for a task score of `0.0`.
+default single judge reproduces the upstream result exactly: **36/38 criteria
+passed**, with `C-014` and `C-033` failing, for a task score of `0.0`.
 
-End to end, `claude-sonnet-4-6` scores **38/38, reward `1.0`** — 7 turns, one
-deliverable written to `$OUTPUT_DIR`. `claude-haiku-4-5` scores `0.0` on the
-same task: it writes a well-formed report to a literal `/output/` instead of
-`$OUTPUT_DIR`, and a deliverable outside the output directory is graded as
-missing. That is upstream's behavior too — upstream bind-mounts only
-`output_dir` to `/workspace/output` and grades the host side of that mount, so
-a write to `/output` is equally invisible there.
+Grading that same deliverable with both judges, `claude-sonnet-4-6` and
+`openai/gpt-5.6-sol` independently returned **36/38 on the same two criteria**,
+`C-014` and `C-033` — reward `0.0`, `all_pass_strict` `0`, no disagreement to
+average.
+
+Note: `claude-haiku-4-5` scores `0.0`: it writes a well-formed report to a literal `/output/` instead of `$OUTPUT_DIR`, and a deliverable outside the output directory is graded as missing. That is the original benchmark's behavior too — upstream bind-mounts only `output_dir` to `/workspace/output` and grades the host side of that mount, so a write to `/output` is equally invisible there.
 
 ## Network
 
