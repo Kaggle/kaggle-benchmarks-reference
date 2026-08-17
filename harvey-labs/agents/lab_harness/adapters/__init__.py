@@ -15,8 +15,9 @@
 """Adapter registry.
 
 Maps a Harbor model name onto a provider adapter and the ModelProxy path that
-serves it. Only Anthropic is wired up today; OpenAI (`/openapi`) and Google
-(`/gemini`) adapters slot in here without touching the agent loop.
+serves it. Anthropic, OpenAI, and Google are all wired up; adding another
+provider means a new adapter class and one entry in each map below, with no
+change to the agent loop.
 """
 
 from .base import ModelAdapter, ModelResponse, ToolCall
@@ -25,13 +26,16 @@ __all__ = ["ModelAdapter", "ModelResponse", "ToolCall", "create_adapter"]
 
 # provider -> ModelProxy path suffix. See
 # experimental/harbor/harbor-base/entrypoint-common.sh for the canonical map.
+#
+# Google routes to `/genai`, not `/gemini`. Both paths exist on the proxy, but
+# `/gemini` answers 405 to every POST -- it is the base URL that entrypoint
+# hands to the gemini-cli agent, not a live API surface. `/genai` serves the
+# Gemini API proper. Please don't "fix" this back.
 _PROXY_PATHS = {
     "anthropic": "anthropic",
     "openai": "openapi",
-    "google": "gemini",
+    "google": "genai",
 }
-
-_SUPPORTED = ("anthropic",)
 
 
 def split_model_name(model_name: str) -> tuple[str, str]:
@@ -70,23 +74,33 @@ def create_adapter(
     Args:
         model_name: Harbor model name, e.g. ``anthropic/claude-sonnet-4-6``.
         proxy_base_url: ModelProxy root, e.g. ``https://mp-staging.kaggle.net/models``.
-        api_key: MODEL_PROXY_API_KEY, sent as a bearer token.
+        api_key: MODEL_PROXY_API_KEY, sent as a bearer token. Google's route is
+            the exception and takes it as ``x-goog-api-key`` instead.
     """
     provider, model = split_model_name(model_name)
 
-    if provider not in _SUPPORTED:
+    if provider not in _PROXY_PATHS:
         known = ", ".join(sorted(_PROXY_PATHS))
         raise ValueError(
-            f"Provider {provider!r} is not supported yet. This port currently "
-            f"implements: {', '.join(_SUPPORTED)}. "
-            f"(Recognized providers, pending adapters: {known}.)"
+            f"Provider {provider!r} is not supported. This port implements: "
+            f"{known}."
         )
 
     base_url = f"{proxy_base_url.rstrip('/')}/{_PROXY_PATHS[provider]}"
 
-    from .anthropic_adapter import AnthropicAdapter
+    # Imported lazily so a broken adapter cannot stop the others loading.
+    if provider == "anthropic":
+        from .anthropic_adapter import AnthropicAdapter as adapter_class
+    elif provider == "openai":
+        from .openai_adapter import OpenAIAdapter as adapter_class
+    else:
+        from .google_adapter import GoogleAdapter as adapter_class
 
-    return AnthropicAdapter(
+    # No per-model allowlist: the provider prefix picks the route, and any
+    # model the proxy serves on it works. This matches how the Anthropic
+    # adapter has always behaved -- its tables tune max_tokens and thinking
+    # for known ids, but an unknown claude-* is still dispatched.
+    return adapter_class(
         model=model,
         base_url=base_url,
         api_key=api_key,

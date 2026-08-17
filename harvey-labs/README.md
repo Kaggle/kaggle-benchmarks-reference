@@ -134,7 +134,9 @@ Harbor entrypoint sets this automatically for custom-import agents.
 
 (Access granted to Kaggle staff only)
 To simulate the Harbor run on Kaggle end-to-end, pull
-https://github.com/kaggle/experimental and then run:
+https://github.com/kaggle/experimental
+
+Then, run this command from the root of this repo:
 
 ```bash
 OUTPUT_DIR=/tmp/kaggle/harvey-lab-outputs \
@@ -181,23 +183,41 @@ when the model stops calling tools, capped at 200 turns.
 It runs as a Harbor _external_ agent: the loop executes on the host and drives
 the container through `environment.exec()`.
 
-Only Anthropic models are wired up for the _agent_ today.
-`adapters/__init__.py` is the seam for the rest: OpenAI (`/openapi`) and Google
-(`/gemini`) already have their ModelProxy paths mapped and need only an adapter
-class each.
+Three model families are wired up for the _agent_, each behind the
+`ModelAdapter` interface in `adapters/`. The loop is provider-agnostic and does
+not change when one is added.
+
+| Provider    | Prefix       | ModelProxy path | API surface                    | Auth                | Verified against                                                          |
+| ----------- | ------------ | --------------- | ------------------------------ | ------------------- | ------------------------------------------------------------------------- |
+| Anthropic   | `anthropic/` | `/anthropic`    | Messages, streaming            | `Authorization`     | `claude-sonnet-4-6`                                                        |
+| OpenAI      | `openai/`    | `/openapi`      | Responses, non-streaming       | `Authorization`     | `gpt-5.6-sol`                                                              |
+| Google      | `google/`    | `/genai`        | `generateContent`, non-streaming | `x-goog-api-key`  | `gemini-3.5-flash-lite`, `gemini-3.6-flash`, `gemini-3.1-pro-preview`      |
+
+No adapter keeps a model allowlist: the prefix picks the route, and any model
+the proxy serves on that route works. Per-model tables tune `max_tokens` and
+reasoning, but an unrecognized id is still dispatched. An unprefixed name is
+inferred from the id (`claude*`, `gpt*`/`o1`/`o3`/`o4`, `gemini*`).
+
+All three adapters echo their provider's reasoning state back verbatim on the
+next turn — Anthropic's signed thinking blocks, Gemini's `thoughtSignature`
+parts, OpenAI's reasoning items. On the Google path, setting a reasoning effort
+also asks for the thought text itself (`includeThoughts`); those parts are
+replayed into history but filtered out of the response text, so they inform the
+next turn without reaching the deliverable.
 
 The _judge_ speaks both Anthropic and OpenAI, but through its own seam in
 `tests/judge.py`, which deliberately shares no code with these adapters: Harbor
 uploads `tests/` into the container by itself, so `judge.py` has to stand alone.
 
-## Intentional deviations from upstream
+## Intentional deviations from the original reference implementation ("upstream")
 
 Everything that shapes what the model sees, or how output is graded, is held
 identical to upstream. These are the places where the Harbor port does
 something different, and why:
 
 1. **Harbor owns the container, not podman.** Upstream starts its own podman
-   sandbox with bind mounts. Here Harbor builds and runs the container.
+   sandbox with bind mounts. Here Harbor builds and runs the container, providing
+   equivalent isolation.
 
 2. **`glob` and `grep` run in-container.** Upstream had host-side access to the
    bind-mounted workspace and searched it directly with Python. Harbor exposes
@@ -213,7 +233,9 @@ something different, and why:
    runs inside Harbor's own interpreter and cannot add dependencies to it;
    `httpx` is one of Harbor's core dependencies, the `anthropic` SDK is not.
    The request bodies, streaming mode, per-model `max_tokens`, temperature
-   rules, and verbatim thinking-block echo are all preserved.
+   rules, and verbatim thinking-block echo are all preserved. The OpenAI and
+   Google adapters follow the same rule for the same reason, so neither uses
+   `openai` or `google-genai` either.
 
 5. **No LLM deliverable matcher.** Upstream's file matcher has a fourth stage
    that asks an LLM which output file corresponds to an expected deliverable
@@ -249,6 +271,75 @@ something different, and why:
 
 11. **`gpt-5.6-sol` substitutes for upstream's `gpt-5.5`.**
     The original benchmark implementation's second default judge is unavailable through ModelProxy (b/545349532). The API shape is the same (OpenAI Responses), so the method is upstream's; the model is not. A dual score from this port is methodologically equivalent to gpt-5.5. We plan to change the judge to gpt-5.5 once the ModelProxy issue is addressed.
+
+12. **OpenAI agent adapter changes.**
+    The OpenAI adapter uses Responses rather than Chat Completions because
+    it is the current surface for the gpt-5 family and because `judge.py`
+    already speaks it, keeping the port to one OpenAI dialect.
+
+13. **Google routes to `/genai`, and authenticates differently.**
+    ModelProxy exposes both `/gemini` and `/genai`. `/gemini` answers `405` to
+    every POST — it is the base URL handed to the `gemini-cli` agent, not a
+    live API surface — so the adapter uses `/genai`, which serves the Gemini
+    API proper. That route also rejects `Authorization: Bearer` with a `401`
+    and requires `x-goog-api-key`. It is the only route in the port that does
+    not use bearer auth, and the only one carrying the model id in the URL path
+    rather than the body.
+
+14. **No `temperature` on the OpenAI agent path.** The agent-side mirror of
+    deviation #9: ModelProxy rejects the parameter for gpt-5.x
+    (`400: not supported with this model`), so the adapter omits it for
+    `gpt-5*`/`o1`/`o3`/`o4`. The consequence is the same — those runs are not
+    temperature-pinned and so may not be reproducible run to run. Anthropic and
+    Google agent runs still send `LAB_TEMPERATURE` (default `0.0`).
+
+15. **Gemini's `MALFORMED_FUNCTION_CALL` is retried inside the adapter.**
+    Gemini sometimes emits tool-call JSON its own backend cannot parse. This
+    arrives as an HTTP `200` carrying `{"content": {"role": "model"}}` with no
+    `parts` and `finishReason: MALFORMED_FUNCTION_CALL` — measured at roughly
+    3-in-10 requests on `gemini-3.1-pro-preview` against the six LAB tools, and
+    far more rarely on the other Gemini models. Because it is a `200` it
+    bypasses the status-based retry ladder, and appending that empty turn to
+    history makes every subsequent request fail with
+    `400 ... must include at least one parts field`, so a single occurrence
+    would otherwise end the run. The adapter therefore treats an empty
+    candidate with a retryable finish reason as a retryable response and
+    re-sends. Retries are bounded by `max_retries`; exhausting them raises.
+
+16. **Nuances with OpenAI models w/reasoning across turns.**
+    ModelProxy rejects `store: true` outright with `400 invalid_prompt`
+    ("store is not supported"); it accepts `store: false`, but replay works
+    either way, so the adapter omits the parameter and matches upstream's
+    payload. And whether the API emits a reasoning item at all is
+    prompt-dependent and not deterministic — measured at 4-in-5 on one fixed
+    prompt and 0-in-3 on another — so a transcript with no reasoning is normal
+    and is not evidence that replay has regressed.
+
+17. **Context overflow is only detected on the Anthropic path.**
+    `loop.py` scores a context overflow as a legitimate run outcome by
+    string-matching the provider's error. Neither new route produces an
+    unambiguous marker: OpenAI answered a ~1M-token request with a generic
+    `500 server_error` (it accepted ~805k fine), and Google answered with a
+    bare `503 "model is currently unavailable"`. Both statuses are already in
+    the retry ladder and are indistinguishable from a transient backend fault,
+    so no marker was added rather than guessing. The practical effect is that
+    an OpenAI or Google run that genuinely overflows will burn its retries and
+    surface as a hard failure instead of a scored partial run. Given LAB's
+    document sizes against these models' context windows, this is a remote
+    case, but it is a real gap.
+
+18. **Google `output_tokens` under-reports thinking.**
+    Gemini reports thinking tokens in `thoughtsTokenCount`, separately from
+    `candidatesTokenCount`, and bills both as output. Upstream's adapter
+    records `candidates_token_count` alone, and this port matches it, so a run
+    with `LAB_REASONING_EFFORT` set spends more output tokens than
+    `metrics.json` shows — and because the adapter sets `includeThoughts`, a
+    thinking run produces them in quantity. Adding the two is the more accurate
+    figure and is what this adapter did originally; it is deliberately not
+    done, so Google numbers stay directly comparable to upstream's. Treat
+    `output_tokens` and `context.n_output_tokens` on this path as an
+    upstream-comparable metric, not a cost estimate. Nothing the model sees is
+    affected. This was filed to upstream at https://github.com/harveyai/harvey-labs/issues/144
 
 Note that shell commands are still wrapped exactly as upstream wraps them —
 `timeout --kill-after=2 <n> bash -lc …`, with `WORKSPACE_DIR`, `DOCUMENTS_DIR`,

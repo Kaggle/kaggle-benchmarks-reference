@@ -83,9 +83,13 @@ DEFAULT_JUDGE_MODEL = "claude-sonnet-4-6"
 # model-identical.
 DEFAULT_OPENAI_JUDGE = "openai/gpt-5.6-sol"
 
-# provider -> ModelProxy path suffix. Same mapping as the agent's
-# adapters/__init__.py, duplicated rather than imported: Harbor uploads
-# tests/ into the container on its own, so this file has to stand alone.
+# provider -> ModelProxy path suffix. Duplicated from the agent's
+# adapters/__init__.py rather than imported: Harbor uploads tests/ into the
+# container on its own, so this file has to stand alone.
+#
+# The agent's map additionally carries `google -> genai`. That divergence is
+# deliberate, not drift: judging is only ever done by Anthropic and OpenAI
+# models, so there is no Gemini judge path to keep in sync.
 _PROXY_PATHS = {"anthropic": "anthropic", "openai": "openapi"}
 
 _VERDICT_SCHEMA = {

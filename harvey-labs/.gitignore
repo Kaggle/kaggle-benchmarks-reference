@@ -7,3 +7,6 @@ results/
 .env
 __pycache__/
 *.pyc
+
+# Kaggle dataset CLI file
+dataset-metadata.json

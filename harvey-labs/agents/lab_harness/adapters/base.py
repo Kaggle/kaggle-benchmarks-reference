@@ -18,8 +18,9 @@ Ported from harvey-labs harness/adapters/base.py (MIT, (c) 2026 Harvey AI).
 
 Each adapter translates between the harness's canonical format and a
 provider's native API. The agent loop only talks to this interface, which is
-the seam where OpenAI and Google support will land: a new adapter routes to a
-different ModelProxy path (/openapi, /gemini) without touching the loop.
+the seam OpenAI and Google support landed on: each adapter routes to a
+different ModelProxy path (/anthropic, /openapi, /genai) without touching the
+loop.
 """
 
 from abc import ABC, abstractmethod

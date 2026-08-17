@@ -159,7 +159,6 @@ class LABHarnessAgent(BaseAgent):
         reasoning_effort = self._get_env(
             "LAB_REASONING_EFFORT", "KAGGLE_AGENT_LLM_REASONING_EFFORT"
         )
-
         adapter = create_adapter(
             model_name=model_name,
             proxy_base_url=proxy_base_url,

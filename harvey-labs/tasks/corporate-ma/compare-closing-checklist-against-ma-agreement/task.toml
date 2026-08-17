@@ -2,6 +2,7 @@ schema_version = "1.4"
 
 [task]
 name = "lab/compare-closing-checklist-against-ma-agreement"
+authors = [{ name = "Harvey AI" }]
 version = "1.0.0"
 description = "Compare a closing checklist against an M&A asset purchase agreement and produce a categorized, severity-rated deviation report."
 keywords = [
@@ -59,7 +60,7 @@ MODEL_PROXY_API_KEY = "${MODEL_PROXY_API_KEY}"
 MODEL_PROXY_BASE_URL = "${MODEL_PROXY_BASE_URL:-https://mp-staging.kaggle.net/models}"
 JUDGE_MODEL = "${LAB_JUDGE_MODEL:-claude-sonnet-4-6}"
 JUDGE_MODELS = "${LAB_JUDGE_MODELS:-}"
-JUDGE_PARALLEL = "${LAB_JUDGE_PARALLEL:-6}"
+JUDGE_PARALLEL = "${LAB_JUDGE_PARALLEL:-8}"
 
 [environment.env]
 
