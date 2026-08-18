@@ -30,8 +30,10 @@ your .env file, using a comma-separated list:
 
 Example:
 ```
-LAB_JUDGE_MODELS="claude-sonnet-4-6,openai/gpt-5.6-sol"
+LAB_JUDGE_MODELS="claude-sonnet-4-6,gpt-5.5"
 ```
+
+That pair is upstream's own default line-up.
 
 Each judge grades every criterion independently and collapses to its _own_
 all-pass verdict; the task reward is the mean of those verdicts. So with two
@@ -225,7 +227,7 @@ Verifier-side, via the host environment (templated in `task.toml`):
 
 `LAB_JUDGE_PARALLEL` is per judge, so dual mode issues up to `2 ×` the
 concurrent calls rather than taking twice as long. A model id may be prefixed
-with its provider (`openai/gpt-5.6-sol`); a bare one is inferred the same way
+with its provider (`openai/gpt-5.5`); a bare one is inferred the same way
 the agent's adapters do.
 
 Raising `LAB_JUDGE_PARALLEL` without also raising `--timeout-multiplier` is
@@ -330,17 +332,14 @@ something different, and why:
    run to run. Anthropic judges still send a temperature of `0.0`.
 
 10. **Judge model ids are sent verbatim.**
-    The provider is inferred the way `adapters/__init__.py` infers it, but the prefix is _not_ stripped: `openai/gpt-5.6-sol` is routed to `/openapi` and sent as `openai/gpt-5.6-sol`. That keeps the default single-judge request a literal byte-for-byte no-op and avoids depending on how each route happens to treat a bare id. `split_model_name`'s stripping return contract is the one thing in that module deliberately not ported from the original implementation.
+    The provider is inferred the way `adapters/__init__.py` infers it, but the prefix is _not_ stripped: `openai/gpt-5.5` is routed to `/openapi` and sent as `openai/gpt-5.5`. That keeps both default judge ids — `claude-sonnet-4-6` and `gpt-5.5`, bare as upstream spells them — literal byte-for-byte no-ops, and avoids depending on how each route happens to treat a prefixed id. `split_model_name`'s stripping return contract is the one thing in that module deliberately not ported from the original implementation.
 
-11. **`gpt-5.6-sol` substitutes for upstream's `gpt-5.5`.**
-    The original benchmark implementation's second default judge is unavailable through ModelProxy (b/545349532). The API shape is the same (OpenAI Responses), so the method is upstream's; the model is not. A dual score from this port is methodologically equivalent to gpt-5.5. We plan to change the judge to gpt-5.5 once the ModelProxy issue is addressed.
-
-12. **OpenAI agent adapter changes.**
+11. **OpenAI agent adapter changes.**
     The OpenAI adapter uses Responses rather than Chat Completions because
     it is the current surface for the gpt-5 family and because `judge.py`
     already speaks it, keeping the port to one OpenAI dialect.
 
-13. **Google routes to `/genai`, and authenticates differently.**
+12. **Google routes to `/genai`, and authenticates differently.**
     ModelProxy exposes both `/gemini` and `/genai`. `/gemini` answers `405` to
     every POST — it is the base URL handed to the `gemini-cli` agent, not a
     live API surface — so the adapter uses `/genai`, which serves the Gemini
@@ -349,14 +348,14 @@ something different, and why:
     not use bearer auth, and the only one carrying the model id in the URL path
     rather than the body.
 
-14. **No `temperature` on the OpenAI agent path.** The agent-side mirror of
+13. **No `temperature` on the OpenAI agent path.** The agent-side mirror of
     deviation #9: ModelProxy rejects the parameter for gpt-5.x
     (`400: not supported with this model`), so the adapter omits it for
     `gpt-5*`/`o1`/`o3`/`o4`. The consequence is the same — those runs are not
     temperature-pinned and so may not be reproducible run to run. Anthropic and
     Google agent runs still send `LAB_TEMPERATURE` (default `0.0`).
 
-15. **Gemini's `MALFORMED_FUNCTION_CALL` is retried inside the adapter.**
+14. **Gemini's `MALFORMED_FUNCTION_CALL` is retried inside the adapter.**
     Gemini sometimes emits tool-call JSON its own backend cannot parse. This
     arrives as an HTTP `200` carrying `{"content": {"role": "model"}}` with no
     `parts` and `finishReason: MALFORMED_FUNCTION_CALL` — measured at roughly
@@ -369,7 +368,7 @@ something different, and why:
     candidate with a retryable finish reason as a retryable response and
     re-sends. Retries are bounded by `max_retries`; exhausting them raises.
 
-16. **Nuances with OpenAI models w/reasoning across turns.**
+15. **Nuances with OpenAI models w/reasoning across turns.**
     ModelProxy rejects `store: true` outright with `400 invalid_prompt`
     ("store is not supported"); it accepts `store: false`, but replay works
     either way, so the adapter omits the parameter and matches upstream's
@@ -378,7 +377,7 @@ something different, and why:
     prompt and 0-in-3 on another — so a transcript with no reasoning is normal
     and is not evidence that replay has regressed.
 
-17. **Context overflow is only detected on the Anthropic path.**
+16. **Context overflow is only detected on the Anthropic path.**
     `loop.py` scores a context overflow as a legitimate run outcome by
     string-matching the provider's error. Neither new route produces an
     unambiguous marker: OpenAI answered a ~1M-token request with a generic
@@ -391,7 +390,7 @@ something different, and why:
     document sizes against these models' context windows, this is a remote
     case, but it is a real gap.
 
-18. **Google `output_tokens` under-reports thinking.**
+17. **Google `output_tokens` under-reports thinking.**
     Gemini reports thinking tokens in `thoughtsTokenCount`, separately from
     `candidatesTokenCount`, and bills both as output. Upstream's adapter
     records `candidates_token_count` alone, and this port matches it, so a run
@@ -421,10 +420,16 @@ criteria passed**, with `C-014` and `C-033` failing, for a task score of `0.0`.
 This is why no task ships a working `solution/solve.sh` — under all-pass
 scoring, even upstream's own answer is a zero.
 
-Grading that same deliverable with both judges, `claude-sonnet-4-6` and
-`openai/gpt-5.6-sol` independently returned **36/38 on the same two criteria**,
-`C-014` and `C-033` — reward `0.0`, `all_pass_strict` `0`, no disagreement to
-average.
+Grading that same deliverable in dual mode with upstream's own pair,
+`claude-sonnet-4-6` and `gpt-5.5`, both judges independently returned **36/38
+on the same two criteria**, `C-014` and `C-033` (the missing NWC de minimis
+collar) — `dual_all_pass_rate` `0.0`, `dual_criterion_pass` `0.9474`,
+`all_pass_strict` `0`, `n_judge_errors` `0`. No disagreement to average: the
+two models agree criterion-for-criterion on upstream's reference answer.
+
+A full Harbor trial on this task — agent phase included, so a freshly written
+deliverable — reproduces those aggregates exactly, with
+the same two criteria failing under both judges.
 
 Note: `claude-haiku-4-5` scores `0.0`: it writes a well-formed report to a literal `/output/` instead of `$OUTPUT_DIR`, and a deliverable outside the output directory is graded as missing. That is the original benchmark's behavior too — upstream bind-mounts only `output_dir` to `/workspace/output` and grades the host side of that mount, so a write to `/output` is equally invisible there.
 

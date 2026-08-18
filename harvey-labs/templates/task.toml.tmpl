@@ -55,7 +55,7 @@ network_mode = "no-network"
 # One Anthropic judge by default. Setting LAB_JUDGE_MODELS to a comma-separated
 # list turns on upstream's dual grading, where each judge collapses to its own
 # all-pass verdict and the reward is their mean:
-#   LAB_JUDGE_MODELS="claude-sonnet-4-6,openai/gpt-5.6-sol"
+#   LAB_JUDGE_MODELS="claude-sonnet-4-6,gpt-5.5"
 [verifier.env]
 MODEL_PROXY_API_KEY = "${MODEL_PROXY_API_KEY}"
 MODEL_PROXY_BASE_URL = "${MODEL_PROXY_BASE_URL:-https://mp-staging.kaggle.net/models}"

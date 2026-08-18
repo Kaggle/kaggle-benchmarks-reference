@@ -77,11 +77,10 @@ _HTTP_RETRIES = 3
 _RETRY_STATUSES = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
 
 DEFAULT_JUDGE_MODEL = "claude-sonnet-4-6"
-# Upstream's second judge is "gpt-5.5" (evaluation/run_eval.py:29), which is
-# not currently routable through ModelProxy (b/545349532). Substituted until
-# it is; dual scores are methodologically comparable to upstream but not
-# model-identical.
-DEFAULT_OPENAI_JUDGE = "openai/gpt-5.6-sol"
+# Upstream's second judge (evaluation/run_eval.py:29), unprefixed as upstream
+# spells it -- ModelProxy's /openapi route serves the bare id, so the dual
+# line-up is model-identical to upstream's.
+DEFAULT_OPENAI_JUDGE = "gpt-5.5"
 
 # provider -> ModelProxy path suffix. Duplicated from the agent's
 # adapters/__init__.py rather than imported: Harbor uploads tests/ into the
