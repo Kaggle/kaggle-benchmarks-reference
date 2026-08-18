@@ -18,7 +18,8 @@ Upstream: <https://github.com/harveyai/harvey-labs> (MIT). See
 
 Each task is scored **all-pass**: `1.0` only if _every_ rubric criterion
 passes, otherwise `0.0`. There is no partial credit — a report that catches 37
-of 38 discrepancies scores the same as one that catches none. This models the
+of 38 discrepancies scores the same as one that catches none. Rubrics run 33 to
+194 criteria depending on the task, so this is a demanding bar. It models the
 reality of legal work, where meeting 9/10 criteria is not 90% useful; it's
 wrong.
 
@@ -32,7 +33,7 @@ Example:
 LAB_JUDGE_MODELS="claude-sonnet-4-6,openai/gpt-5.6-sol"
 ```
 
-Each judge grades all 38 criteria independently and collapses to its _own_
+Each judge grades every criterion independently and collapses to its _own_
 all-pass verdict; the task reward is the mean of those verdicts. So with two
 judges the reward is `0.0`, `0.5`, or `1.0`, and a `0.5` means the judges
 disagreed about whether the task passed at all. This is upstream's
@@ -69,29 +70,78 @@ The verifier leaves a zero reward behind, which reads as an infrastructure failu
 harvey-labs/
 ├── config.yaml                    # Harbor job config
 ├── metrics/metric.py              # dataset-level Pass@1 aggregator
+├── templates/                     # single source of truth for task boilerplate
+├── scripts/port_tasks.py          # generates tasks/ from upstream + templates/
 ├── agents/lab_harness/            # the ported Harvey agent harness
 │   ├── agent.py                   #   Harbor BaseAgent entry point
 │   ├── loop.py                    #   the agent loop
 │   ├── tools.py                   #   the six tools
 │   ├── adapters/                  #   per-provider model adapters
 │   └── assets/                    #   system prompt + docx/pptx/xlsx skills
-└── tasks/<legal-practice-area>/<task>/
+└── tasks/<legal-practice-area>/<task>/    # generated, not committed
     ├── task.toml                  # Harbor task config
     ├── instruction.md             # what the agent is told
     ├── environment/
     │   ├── Dockerfile             # the task container
     │   ├── documents/             # read-only source documents
     │   └── parse_doc.py           # .docx/.pdf/.pptx/.xlsx text extraction
+    ├── solution/solve.sh          # no reference solution exists; exits 1
     └── tests/
         ├── test.sh                # Harbor verifier entry point
         ├── judge.py               # LLM-as-judge rubric scorer
-        ├── task.json              # the rubric (38 criteria)
+        ├── task.json              # the rubric (23–1,114 criteria)
         └── rubric_criterion.txt   # the judge prompt
 ```
 
 `task.json` holds the rubric, so it lives under `tests/`. Harbor uploads
 `tests/` only at verification time, after the agent phase is over — the agent
 never has a filesystem path to the answers.
+
+Every task is the same shape — same Dockerfile, judge, verifier, and prompt —
+differing only in its documents and rubric. Those files are not shared but
+copied, because Harbor cannot follow a symlink at any layer (upload, build
+context, content hash, publish). `templates/` is the source of truth and
+`scripts/port_tasks.py` materializes the copies; see [Adding tasks](#adding-tasks).
+
+`tasks/` is generated and **not committed** — it is 2.9 GB of already-compressed
+`.docx`/`.xlsx` across 67,000 files, which git cannot pack down and cannot later
+drop without rewriting history. It is gitignored; run the generator to
+materialize it (see [Adding tasks](#adding-tasks)). Everything the generator
+needs — `templates/`, `scripts/`, `config.yaml` — is tracked, so the tree is
+reproducible from a `harvey-labs` checkout at the pinned `SOURCE_COMMIT`.
+
+Ported: **1,760 tasks across 26 practice areas**, 111,814 rubric criteria.
+Upstream's 27th area, `firm-knowledge`, is not ported — its 250 tasks own no
+documents, instead sharing one 525 MB corpus via `docs_dir: "../../dms"`. A
+Harbor task dir must be self-contained, so porting them means copying that
+corpus 250 times (~130 GB). That needs a shared-corpus mechanism Harbor does not
+have; see `scripts/port_tasks.py:SKIP_AREAS`.
+
+Harbor discovers tasks exactly one level below a dataset path
+(`DatasetConfig._get_local_task_configs` uses `iterdir`, not `rglob`), so none of
+upstream's nesting survives. Every path below the practice area is flattened into
+one directory name by joining its segments with `-`:
+
+```
+corporate-ma/analyze-cim-deal-teaser/scenario-02
+    -> tasks/corporate-ma/analyze-cim-deal-teaser-scenario-02
+contracts/ip-licensing/license-agreement-first-draft/scenario-01
+    -> tasks/contracts/ip-licensing-license-agreement-first-draft-scenario-01
+```
+
+The `-scenario-NN` suffix is applied uniformly, even to tasks that ship only
+`scenario-01`, so the rule stays a rule rather than a rule plus an exception.
+
+The Harbor package name additionally carries the practice area —
+`lab/corporate-ma-identify-tsa-issues`. Directory paths are area-scoped and
+cannot collide, but the package name is global and 18 slugs repeat across areas
+(`draft-commitment-letter` exists in both `banking-finance` and `corporate-ma`).
+Harbor does not enforce name uniqueness, so without the prefix those would
+collide silently rather than fail.
+
+That same one-level discovery rule is why `config.yaml` lists each area
+explicitly rather than `path: tasks`, which would yield zero tasks. **Each new
+practice area needs its own `datasets:` entry.**
 
 ## Environment variables
 
@@ -107,8 +157,15 @@ Assumes that you have pulled / cloned Harbor framework (https://github.com/laude
 to `/home/kaggle/git/harbor`.
 
 ```bash
-# Whole job (all tasks, Pass@1 metric).
+# Whole job (all 1,760 tasks, Pass@1 metric). This is ~112,000 judge calls --
+# for anything but a full benchmark run, scope it to one practice area instead.
 PYTHONPATH=$PWD uv run --project /home/kaggle/git/harbor harbor run -c config.yaml
+
+# One practice area.
+PYTHONPATH=$PWD uv run --project /home/kaggle/git/harbor harbor run \
+  -p tasks/corporate-ma -e docker \
+  --agent agents.lab_harness:LABHarnessAgent \
+  --model anthropic/claude-sonnet-4-6
 
 # One task format.
 PYTHONPATH=$PWD uv run --project /home/kaggle/git/harbor harbor run \
@@ -164,12 +221,18 @@ Verifier-side, via the host environment (templated in `task.toml`):
 | -------------------- | ------------------- | ---------------------------------------------------------- |
 | `LAB_JUDGE_MODEL`    | `claude-sonnet-4-6` | The single judge                                            |
 | `LAB_JUDGE_MODELS`   | unset               | Comma-separated list; two or more enables dual grading      |
-| `LAB_JUDGE_PARALLEL` | `6`                 | Concurrent judge calls **per judge**                        |
+| `LAB_JUDGE_PARALLEL` | `8`                 | Concurrent judge calls **per judge**                        |
 
 `LAB_JUDGE_PARALLEL` is per judge, so dual mode issues up to `2 ×` the
 concurrent calls rather than taking twice as long. A model id may be prefixed
 with its provider (`openai/gpt-5.6-sol`); a bare one is inferred the same way
 the agent's adapters do.
+
+Raising `LAB_JUDGE_PARALLEL` without also raising `--timeout-multiplier` is
+safe, but lowering it is not: each task's `verifier.timeout_sec` is sized
+assuming 8 concurrent calls (see `scripts/port_tasks.py:verifier_timeout`), and
+a 194-criterion rubric graded serially will not finish inside it. A verifier
+that times out scores 0.0, which is indistinguishable from a failed task.
 
 ## Agent
 
@@ -351,9 +414,12 @@ to the workspace by those variable names, the login shell is what puts
 
 ### Verified fidelity
 
-Re-scoring upstream's own reference deliverable for this task with this port's
-default single judge reproduces the upstream result exactly: **36/38 criteria
-passed**, with `C-014` and `C-033` failing, for a task score of `0.0`.
+Upstream publishes a reference deliverable for exactly one task,
+`compare-closing-checklist-against-ma-agreement`. Re-scoring it with this
+port's default single judge reproduces the upstream result exactly: **36/38
+criteria passed**, with `C-014` and `C-033` failing, for a task score of `0.0`.
+This is why no task ships a working `solution/solve.sh` — under all-pass
+scoring, even upstream's own answer is a zero.
 
 Grading that same deliverable with both judges, `claude-sonnet-4-6` and
 `openai/gpt-5.6-sol` independently returned **36/38 on the same two criteria**,
@@ -383,9 +449,46 @@ index.
 
 ## Adding tasks
 
-Each task is self-contained under `tasks/<practice-area>/<task>/`. To port
-another one from upstream, copy its `documents/` into `environment/` and its
-`task.json` into `tests/`, then reuse this task's `task.toml`, `Dockerfile`,
-`test.sh`, `judge.py`, and `rubric_criterion.txt` as-is — only `n_criteria`,
-the task name, and `instruction.md` change. `instruction.md` should carry the
-`instructions` field from `task.json` verbatim.
+Each task is self-contained under `tasks/<practice-area>/<task>/`, but the
+task dirs are **generated, not hand-edited, and not committed** — `tasks/` is
+gitignored. `templates/` holds the six task-invariant files and
+`scripts/port_tasks.py` stamps them out against upstream's `task.json` and
+`documents/`. Run this first in a fresh clone; nothing under `tasks/` exists
+until you do:
+
+```bash
+# Port (or re-port) every area. Idempotent; ~1 minute, ~2.9 GB.
+python3 scripts/port_tasks.py --upstream /path/to/harvey-labs --area all
+
+# One area.
+python3 scripts/port_tasks.py --area corporate-ma
+
+# Assert the generated tasks still match the templates. Exits 1 on drift.
+python3 scripts/port_tasks.py --area all --check
+```
+
+`--upstream` must point at a `harvey-labs` checkout at the commit recorded in
+`scripts/port_tasks.py:SOURCE_COMMIT`, which is also stamped into every
+`task.toml` as `metadata.source_commit`. That pin is what makes the generated
+tree reproducible from the few tracked files.
+
+To change something for every task — fix a judge bug, add a Dockerfile
+dependency, adjust the verifier prompt — edit the file under `templates/` and
+re-run the generator. Editing one task's copy directly will be reported by
+`--check` and lost on the next run.
+
+What the generator derives per task: `tests/task.json` copied byte-for-byte,
+`instruction.md` from the `instructions` field verbatim, `environment/documents/`
+copied, and `task.toml`'s name, description, keywords, `work_type`,
+`n_criteria`, and `verifier.timeout_sec` computed from `task.json`.
+
+Upstream ships three `task.json` schemas and the generator handles the two that
+are portable. Most tasks carry `work_type` and `tags`; the 498 `contracts` tasks
+carry only `title`, `instructions`, and `criteria`, so their `work_type` line is
+omitted rather than guessed and their keywords come from the sector directory.
+Grading is unaffected either way — `judge.py` reads only `title` and `criteria`,
+and builds its deliverable map from per-criterion `deliverables` lists, falling
+back to loading all output when a task has none.
+
+Adding an area upstream has not ported before means a `datasets:` entry in
+`config.yaml` (see [Layout](#layout)) and nothing else.
