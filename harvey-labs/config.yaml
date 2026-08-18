@@ -41,8 +41,47 @@ agents:
   - import_path: agents.lab_harness:LABHarnessAgent
     model_name: anthropic/claude-sonnet-4-6
 
+# One entry per practice area, not a single `path: tasks`. Harbor discovers
+# tasks exactly one level below a dataset path -- DatasetConfig
+# ._get_local_task_configs uses `iterdir`, not `rglob` -- so `path: tasks`
+# would find only the practice-area dirs, none of which has a task.toml, and
+# silently yield zero tasks.
+#
+# 1,760 tasks across 26 areas. Running all of them is on the order of 112,000
+# judge calls; scope a run with `harbor run -p tasks/<area>` or a trimmed copy
+# of this list. Upstream's 27th area, firm-knowledge, is not ported -- see
+# scripts/port_tasks.py:SKIP_AREAS.
+#
+# tasks/ is gitignored and generated. Run
+#   python3 scripts/port_tasks.py --upstream /path/to/harvey-labs --area all
+# before any of these paths resolve.
 datasets:
-  - path: tasks
+  - path: tasks/antitrust-competition
+  - path: tasks/arbitration-international-dispute-resolution
+  - path: tasks/banking-finance
+  - path: tasks/bankruptcy-restructuring
+  - path: tasks/capital-markets
+  - path: tasks/contracts
+  - path: tasks/corporate-governance
+  - path: tasks/corporate-ma
+  - path: tasks/data-privacy-cybersecurity
+  - path: tasks/diligence
+  - path: tasks/emerging-companies-venture-capital
+  - path: tasks/employment-labor
+  - path: tasks/energy-natural-resources
+  - path: tasks/environmental-esg
+  - path: tasks/funds-asset-management
+  - path: tasks/healthcare-life-sciences
+  - path: tasks/immigration
+  - path: tasks/insurance
+  - path: tasks/intellectual-property
+  - path: tasks/international-trade-sanctions
+  - path: tasks/litigation-dispute-resolution
+  - path: tasks/real-estate
+  - path: tasks/structured-finance-securitization
+  - path: tasks/tax
+  - path: tasks/trusts-estates-private-client
+  - path: tasks/white-collar-defense-investigations
 
 metrics:
   # Pass@1 across tasks: the mean of per-task all-pass scores.

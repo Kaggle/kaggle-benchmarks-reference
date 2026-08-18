@@ -10,3 +10,14 @@ __pycache__/
 
 # Kaggle dataset CLI file
 dataset-metadata.json
+
+# Generated task directories -- 2.9 GB of already-compressed .docx/.xlsx that
+# git cannot pack down, across 67,000 files. They are not committed; the Kaggle
+# dataset build materializes them with
+#
+#   python3 scripts/port_tasks.py --upstream /path/to/harvey-labs --area all
+#
+# against upstream at the commit pinned in scripts/port_tasks.py:SOURCE_COMMIT.
+# templates/ + scripts/ + config.yaml are the tracked source of truth; see the
+# "Adding tasks" section of README.md.
+tasks/

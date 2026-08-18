@@ -2,9 +2,11 @@
 # There is no reference solution for this task.
 #
 # Harvey LAB ships no golden files. The deliverable is a free-form document
-# graded by an LLM against a 38-criterion rubric, and upstream's own published
-# reference output for this task scores 36/38 -- which, under all-pass scoring,
-# is 0.0. So there is nothing to copy in that would demonstrate a passing run.
+# graded by an LLM against a @@N_CRITERIA@@-criterion rubric, and no known output
+# satisfies every criterion -- upstream's own published reference output for
+# the one task where it is available falls short (see README, "Verified
+# fidelity"), which under all-pass scoring is 0.0. So there is nothing to copy
+# in that would demonstrate a passing run.
 #
 # This script exists to make that explicit. Harbor's OracleAgent runs
 # solution/solve.sh; rather than exit 0 and let an oracle run look like it
@@ -17,7 +19,7 @@ No reference solution exists for this task.
 
 Harvey LAB deliverables are free-form documents scored by an LLM judge against
 a rubric; the benchmark ships no golden files, and no known output satisfies
-all 38 criteria. Run this task with a real agent instead:
+all @@N_CRITERIA@@ criteria. Run this task with a real agent instead:
 
   harbor run -p <this task dir> -e docker \
     --agent agents.lab_harness:LABHarnessAgent \
