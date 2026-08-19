@@ -257,15 +257,25 @@ not change when one is added.
 | Anthropic   | `anthropic/` | `/anthropic`    | Messages, streaming            | `Authorization`     | `claude-sonnet-4-6`                                                        |
 | OpenAI      | `openai/`    | `/openapi`      | Responses, non-streaming       | `Authorization`     | `gpt-5.6-sol`                                                              |
 | Google      | `google/`    | `/genai`        | `generateContent`, non-streaming | `x-goog-api-key`  | `gemini-3.5-flash-lite`, `gemini-3.6-flash`, `gemini-3.1-pro-preview`      |
+| xAI         | `xai/`       | `/openapi`      | Responses, non-streaming       | `Authorization`     | `grok-4.5`                                                                 |
+
+xAI shares OpenAI's `/openapi` path and its adapter. There is no xAI route on
+the proxy — `/models/xai/grok-4.5` answers 404 and every other `/models/xai/…`
+spelling answers 405 — while `/openapi` serves Grok on the Responses API. The
+adapter class is therefore named `OpenAPIAdapter`, after the route rather than
+a vendor. Grok accepts `temperature`, unlike the gpt-5 family, so it stays
+temperature-pinned; tool calls and verbatim reasoning replay both work
+unmodified.
 
 No adapter keeps a model allowlist: the prefix picks the route, and any model
 the proxy serves on that route works. Per-model tables tune `max_tokens` and
 reasoning, but an unrecognized id is still dispatched. An unprefixed name is
-inferred from the id (`claude*`, `gpt*`/`o1`/`o3`/`o4`, `gemini*`).
+inferred from the id (`claude*`, `gpt*`/`o1`/`o3`/`o4`, `gemini*`, `grok*`).
 
-All three adapters echo their provider's reasoning state back verbatim on the
+Every adapter echoes its provider's reasoning state back verbatim on the
 next turn — Anthropic's signed thinking blocks, Gemini's `thoughtSignature`
-parts, OpenAI's reasoning items. On the Google path, setting a reasoning effort
+parts, and the reasoning items returned by both OpenAI and Grok on the
+`/openapi` route. On the Google path, setting a reasoning effort
 also asks for the thought text itself (`includeThoughts`); those parts are
 replayed into history but filtered out of the response text, so they inform the
 next turn without reaching the deliverable.
