@@ -12,18 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""OpenAI adapter, routed through Kaggle's ModelProxy's /openapi path.
+"""Adapter for Kaggle ModelProxy's /openapi path.
+
+Named for the route, not for a vendor: /openapi is ModelProxy's
+Responses-API surface, and it serves more than one provider. OpenAI's gpt-5.x
+and o-series ride it, and so does xAI's Grok -- there is no /xai route on the
+proxy (``/models/xai/...`` answers 404), so ``xai/grok-4.5`` is dispatched
+here with its prefix stripped. See the registry in ``__init__.py``.
 
 Preserves the harness's contract: the same six tools with the same schemas,
 the same system prompt, and a loop that ends when the model stops calling
 tools. Only the wire format differs.
 
 The Responses API is used rather than Chat Completions: it is the current
-surface for the gpt-5 family, and ``tests/judge.py`` is consistent.
+surface for the gpt-5 family, Grok is compatible with it, and
+``tests/judge.py`` is consistent.
 
 Like the Anthropic adapter, this one replays the model's reasoning across
-turns, so gpt-5.x continues its previous chain of thought rather than
+turns, so the model continues its previous chain of thought rather than
 re-deriving one. ``store`` is left off the payload entirely; see ``_flatten``.
+Verified on Grok as well: replaying its ``reasoning`` items verbatim across a
+tool-calling turn is accepted.
 
 Like the Anthropic adapter, the transport is ``httpx`` rather than the
 ``openai`` SDK: this agent runs in Harbor's executor process and cannot add
@@ -49,6 +58,11 @@ from .base import ModelAdapter, ModelResponse, ToolCall
 # `temperature` whenever no effort is set, which is exactly the default
 # config.yaml path for gpt-5.x and exactly the 400 that README deviation #14
 # exists to prevent.
+#
+# Grok is deliberately absent: `grok-4.5` was tested against mp-staging with
+# `temperature: 0.0` and answered 200, so it falls through this tuple and does
+# get temperature-pinned. Don't add it "for symmetry" -- that would silently
+# give up determinism on the xAI route for no reason.
 NO_TEMPERATURE_MODELS = ("gpt-5", "o1", "o3", "o4")
 
 # Statuses worth another attempt: rate limits, overload, and transient 5xx.
@@ -56,7 +70,7 @@ NO_TEMPERATURE_MODELS = ("gpt-5", "o1", "o3", "o4")
 _RETRY_STATUSES = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
 
 
-class OpenAIAPIError(RuntimeError):
+class OpenAPIError(RuntimeError):
     """A non-retryable error returned by the Responses API.
 
     The message embeds the API's own error text. The agent loop inspects it
@@ -68,11 +82,14 @@ class OpenAIAPIError(RuntimeError):
     def __init__(self, status_code: int, body: str):
         self.status_code = status_code
         self.body = body
-        super().__init__(f"OpenAI API error {status_code}: {body}")
+        super().__init__(f"OpenAPI route error {status_code}: {body}")
 
 
-class OpenAIAdapter(ModelAdapter):
-    """Adapter for OpenAI's models via ModelProxy's /openapi route."""
+class OpenAPIAdapter(ModelAdapter):
+    """Adapter for models served on ModelProxy's /openapi route.
+
+    Currently OpenAI's gpt-5.x / o-series and xAI's Grok.
+    """
 
     # Max output tokens per model family. Unlike Anthropic's `max_tokens`,
     # `max_output_tokens` bounds reasoning *and* visible output together, so a
@@ -90,8 +107,12 @@ class OpenAIAdapter(ModelAdapter):
     # 403 "max estimated cost of operation ($N) exceeds your available quota"
     # rather than as anything wrong with the request. That is an environment
     # condition to wait out, not a reason to shrink the cap.
+    # grok-4.5 lands on the same 128000 via the fallback; it is spelled out
+    # here for the same reason the Anthropic table enumerates known ids, and
+    # because its 500k context leaves plenty of room for this ceiling.
     MAX_OUTPUT = {
         "gpt-5": 128000,
+        "grok-4.5": 128000,
     }
 
     def __init__(
@@ -158,13 +179,13 @@ class OpenAIAdapter(ModelAdapter):
         status = response.get("status")
         if status == "incomplete":
             details = response.get("incomplete_details") or {}
-            raise OpenAIAPIError(
+            raise OpenAPIError(
                 200,
                 f"response incomplete (reason={details.get('reason', 'unknown')}, "
                 f"max_output_tokens={self.max_tokens})",
             )
         if response.get("error"):
-            raise OpenAIAPIError(200, json.dumps(response["error"]))
+            raise OpenAPIError(200, json.dumps(response["error"]))
 
         output = response.get("output", []) or []
 
@@ -213,8 +234,8 @@ class OpenAIAdapter(ModelAdapter):
                 if response.status_code == 200:
                     return response.json()
                 if response.status_code not in _RETRY_STATUSES:
-                    raise OpenAIAPIError(response.status_code, response.text)
-                last_error = OpenAIAPIError(response.status_code, response.text)
+                    raise OpenAPIError(response.status_code, response.text)
+                last_error = OpenAPIError(response.status_code, response.text)
             except (httpx.TransportError, httpx.StreamError) as e:
                 last_error = e
 

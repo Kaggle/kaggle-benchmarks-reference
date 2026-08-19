@@ -15,9 +15,10 @@
 """Adapter registry.
 
 Maps a Harbor model name onto a provider adapter and the ModelProxy path that
-serves it. Anthropic, OpenAI, and Google are all wired up; adding another
-provider means a new adapter class and one entry in each map below, with no
-change to the agent loop.
+serves it. Anthropic, OpenAI, Google, and xAI are all wired up; adding another
+provider means an entry in each map below -- and a new adapter class only if
+the provider's wire format isn't already covered -- with no change to the
+agent loop.
 """
 
 from .base import ModelAdapter, ModelResponse, ToolCall
@@ -31,10 +32,17 @@ __all__ = ["ModelAdapter", "ModelResponse", "ToolCall", "create_adapter"]
 # `/gemini` answers 405 to every POST -- it is the base URL that entrypoint
 # hands to the gemini-cli agent, not a live API surface. `/genai` serves the
 # Gemini API proper. Please don't "fix" this back.
+#
+# xAI maps to `openapi`, the same path as OpenAI. This is not a copy-paste
+# slip: the proxy has no xAI route of its own -- `/models/xai/grok-4.5` is a
+# 404 and every other `/models/xai/...` spelling answers 405 -- while
+# `/openapi` serves Grok on the Responses API and returns genuine xAI output.
+# Two providers sharing one path is the correct mapping here.
 _PROXY_PATHS = {
     "anthropic": "anthropic",
     "openai": "openapi",
     "google": "genai",
+    "xai": "openapi",
 }
 
 
@@ -56,6 +64,8 @@ def split_model_name(model_name: str) -> tuple[str, str]:
         return "openai", model_name
     if lowered.startswith("gemini"):
         return "google", model_name
+    if lowered.startswith("grok"):
+        return "xai", model_name
     raise ValueError(
         f"Cannot infer a provider from model name {model_name!r}. "
         "Pass a provider-prefixed name such as 'anthropic/claude-sonnet-4-6'."
@@ -91,8 +101,12 @@ def create_adapter(
     # Imported lazily so a broken adapter cannot stop the others loading.
     if provider == "anthropic":
         from .anthropic_adapter import AnthropicAdapter as adapter_class
-    elif provider == "openai":
-        from .openai_adapter import OpenAIAdapter as adapter_class
+    elif provider in ("openai", "xai"):
+        # One adapter for both: /openapi is a Responses-API surface, and Grok
+        # speaks it -- tool calls, reasoning replay, and temperature all
+        # verified against mp-staging. A separate xAI class would be an empty
+        # subclass that drifts.
+        from .openapi_adapter import OpenAPIAdapter as adapter_class
     else:
         from .google_adapter import GoogleAdapter as adapter_class
 

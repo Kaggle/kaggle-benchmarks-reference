@@ -36,6 +36,7 @@ agents:
   #   google/gemini-3.5-flash-lite
   #   google/gemini-3.6-flash
   #   google/gemini-3.1-pro-preview
+  #   xai/grok-4.5
   # The default is held on a cheaper Anthropic model for stable comparisons.
   # See the Agent section of README.md.
   - import_path: agents.lab_harness:LABHarnessAgent
