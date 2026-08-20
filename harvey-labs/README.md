@@ -80,18 +80,22 @@ harvey-labs/
 │   ├── tools.py                   #   the six tools
 │   ├── adapters/                  #   per-provider model adapters
 │   └── assets/                    #   system prompt + docx/pptx/xlsx skills
+├── assets/                        # staged shared corpus, generated, not committed
+│   ├── dataset-metadata.json      #   Kaggle dataset id (hand-written)
+│   └── dms/                       #   firm-knowledge corpus; see The shared corpus
 └── tasks/<legal-practice-area>/<task>/    # generated, not committed
     ├── task.toml                  # Harbor task config
     ├── instruction.md             # what the agent is told
     ├── environment/
     │   ├── Dockerfile             # the task container
     │   ├── documents/             # read-only source documents
+    │   │                          #   (absent in firm-knowledge; mounted)
     │   └── parse_doc.py           # .docx/.pdf/.pptx/.xlsx text extraction
     ├── solution/solve.sh          # no reference solution exists; exits 1
     └── tests/
         ├── test.sh                # Harbor verifier entry point
         ├── judge.py               # LLM-as-judge rubric scorer
-        ├── task.json              # the rubric (23–1,114 criteria)
+        ├── task.json              # the rubric (1–1,114 criteria)
         └── rubric_criterion.txt   # the judge prompt
 ```
 
@@ -106,18 +110,20 @@ context, content hash, publish). `templates/` is the source of truth and
 `scripts/port_tasks.py` materializes the copies; see [Adding tasks](#adding-tasks).
 
 `tasks/` is generated and **not committed** — it is 2.9 GB of already-compressed
-`.docx`/`.xlsx` across 67,000 files, which git cannot pack down and cannot later
+`.docx`/`.xlsx` across 70,000 files, which git cannot pack down and cannot later
 drop without rewriting history. It is gitignored; run the generator to
 materialize it (see [Adding tasks](#adding-tasks)). Everything the generator
 needs — `templates/`, `scripts/`, `config.yaml` — is tracked, so the tree is
 reproducible from a `harvey-labs` checkout at the pinned `SOURCE_COMMIT`.
 
-Ported: **1,760 tasks across 26 practice areas**, 111,814 rubric criteria.
-Upstream's 27th area, `firm-knowledge`, is not ported — its 250 tasks own no
-documents, instead sharing one 525 MB corpus via `docs_dir: "../../dms"`. A
-Harbor task dir must be self-contained, so porting them means copying that
-corpus 250 times (~130 GB). That needs a shared-corpus mechanism Harbor does not
-have; see `scripts/port_tasks.py:SKIP_AREAS`.
+Ported: **2,010 tasks across all 27 practice areas**, 114,437 rubric criteria.
+
+Copying is not viable for one of those areas. `firm-knowledge`'s 250 tasks own
+no documents — each sets `docs_dir: "../../dms"`, and they all resolve to one
+525 MB / 9,288-file corpus. A self-contained copy per task would cost ~128 GB,
+more than every other area combined, so these tasks ship with no `documents/`
+at all and read the corpus from a read-only bind mount instead; see
+[The shared corpus](#the-shared-corpus).
 
 Harbor discovers tasks exactly one level below a dataset path
 (`DatasetConfig._get_local_task_configs` uses `iterdir`, not `rglob`), so none of
@@ -145,6 +151,82 @@ That same one-level discovery rule is why `config.yaml` lists each area
 explicitly rather than `path: tasks`, which would yield zero tasks. **Each new
 practice area needs its own `datasets:` entry.**
 
+## The shared corpus
+
+`firm-knowledge` is the one area whose tasks carry no documents. All 250 read a
+single 525 MB corpus, which is bind-mounted read-only into the task container at
+run time rather than baked into 250 images. **Its tasks fail without that
+mount** — the agent finds an empty `documents/` and has nothing to work from.
+
+Stage the corpus once, then run with it mounted:
+
+```bash
+python3 scripts/port_tasks.py --area firm-knowledge --sync-assets
+
+cd /home/kaggle/git/experimental/experimental/harbor
+./run-local-datasets.sh --env-file .env.<agent> -y \
+  --task-def /path/to/harvey-labs-port \
+  --task-sub-path tasks/firm-knowledge/001 \
+  --mount /kaggle/input/harvey-lab-task-shared-documents=/path/to/harvey-labs-port/assets
+```
+
+The mount source is this repo's `assets/`, not the upstream checkout, so what
+runs locally is byte-for-byte what the Kaggle dataset publishes.
+
+`--mount` reaches the task container, not just the runner: the script turns each
+flag into a `HARBOR_ENV_MOUNTS_JSON` entry, the entrypoint forwards it as
+`harbor run --mounts`, and Harbor writes it into `services.main.volumes` — and
+`main` is the container built from `environment/Dockerfile`. The cost per trial
+is a mount, not a copy.
+
+Two details are deliberate:
+
+- **The mount path is the dataset's, not `/workspace/documents`.** Harbor
+  applies `--mounts` to *every* task container in a run, so mounting at the
+  workspace path would shadow the baked-in documents of any other area running
+  alongside. The image symlinks `/workspace/documents` at the mount instead,
+  which keeps `DOCUMENTS_PATH` in `agents/lab_harness/tools.py` true for all 27
+  areas. The path is `/kaggle/input/<dataset-slug>`, matching where Kaggle
+  mounts an attached dataset, and the corpus sits one level below it in `dms/`
+  so a second shared corpus could join the same dataset later.
+- **The symlink is created by `RUN`, not shipped in the build context.** Harbor
+  hashes symlinks without following them and its tar extraction filter rejects
+  them. It dangles at build time and resolves when the corpus is bound.
+  Read-only comes from the bind, which is why the shared variant has no
+  `chmod -R a-w`.
+
+See `scripts/port_tasks.py:SHARED_CORPUS_AREAS`, which maps the area to its
+corpus directory and mount path; the generator prints the exact `--mount` flag
+when it materializes the area.
+
+### Publishing the corpus
+
+The corpus ships as its own Kaggle dataset, separate from the task tree. It
+lives in the upstream checkout, so `--sync-assets` mirrors it into `assets/`
+first — that dir is the staging area for the dataset and the mount source for a
+local run:
+
+```bash
+# Copy new/changed documents in, delete ones upstream dropped.
+python3 scripts/port_tasks.py --area firm-knowledge --sync-assets
+
+kaggle datasets create -p assets --dir-mode zip     # or `version -p assets`
+```
+
+Two things about `assets/`:
+
+- **`dataset-metadata.json` is hand-written and not tracked.** `assets/` is
+  gitignored, the sync never creates or deletes this file (it prunes only
+  `assets/dms/`), and the Kaggle CLI strips it from the upload rather than
+  publishing it. If it goes missing the generator says so; recreate it with the
+  id in `scripts/port_tasks.py:SHARED_ASSETS_DATASET`.
+- **`--dir-mode zip`** uploads each top-level dir as one archive, which Kaggle
+  expands on attach. Without it the 9,288 files are skipped entirely.
+
+Keep the corpus pinned to the same `SOURCE_COMMIT` as the task tree — the
+rubrics name specific matter numbers, so a corpus and a rubric set from
+different upstream commits will silently mis-grade rather than fail.
+
 ## Environment variables
 
 Create a `.env` file (gitignored) with the following contents:
@@ -159,8 +241,9 @@ Assumes that you have pulled / cloned Harbor framework (https://github.com/laude
 to `/home/kaggle/git/harbor`.
 
 ```bash
-# Whole job (all 1,760 tasks, Pass@1 metric). This is ~112,000 judge calls --
+# Whole job (all 2,010 tasks, Pass@1 metric). This is ~114,000 judge calls --
 # for anything but a full benchmark run, scope it to one practice area instead.
+# firm-knowledge additionally needs its corpus mounted; see The shared corpus.
 PYTHONPATH=$PWD uv run --project /home/kaggle/git/harbor harbor run -c config.yaml
 
 # One practice area.
@@ -464,12 +547,12 @@ index.
 
 ## Adding tasks
 
-Each task is self-contained under `tasks/<practice-area>/<task>/`, but the
-task dirs are **generated, not hand-edited, and not committed** — `tasks/` is
-gitignored. `templates/` holds the six task-invariant files and
-`scripts/port_tasks.py` stamps them out against upstream's `task.json` and
-`documents/`. Run this first in a fresh clone; nothing under `tasks/` exists
-until you do:
+Each task is self-contained under `tasks/<practice-area>/<task>/` — except the
+shared-corpus area, which reads its documents from a mount. Task dirs are
+**generated, not hand-edited, and not committed** — `tasks/` is gitignored.
+`templates/` holds the task-invariant files and `scripts/port_tasks.py` stamps
+them out against upstream's `task.json` and `documents/`. Run this first in a
+fresh clone; nothing under `tasks/` exists until you do:
 
 ```bash
 # Port (or re-port) every area. Idempotent; ~1 minute, ~2.9 GB.
@@ -477,6 +560,10 @@ python3 scripts/port_tasks.py --upstream /path/to/harvey-labs --area all
 
 # One area.
 python3 scripts/port_tasks.py --area corporate-ma
+
+# Stage the shared corpus into assets/ as well. Not implied by --area all,
+# since most runs have no reason to move 525 MB. See The shared corpus.
+python3 scripts/port_tasks.py --area firm-knowledge --sync-assets
 
 # Assert the generated tasks still match the templates. Exits 1 on drift.
 python3 scripts/port_tasks.py --area all --check
@@ -497,6 +584,15 @@ What the generator derives per task: `tests/task.json` copied byte-for-byte,
 copied, and `task.toml`'s name, description, keywords, `work_type`,
 `n_criteria`, and `verifier.timeout_sec` computed from `task.json`.
 
+`environment/Dockerfile` is rendered from `Dockerfile.tmpl` plus one of two
+stanzas — `documents-baked.stanza` or `documents-mounted.stanza` — chosen by
+whether the area is in `SHARED_CORPUS_AREAS`. Everything else about the
+environment is identical across all 2,010 tasks, and keeping it in one template
+is what stops the two variants from drifting. A shared-corpus task gets no
+`documents/` dir, and the generator checks its `docs_dir` really does resolve to
+the area's one corpus rather than silently producing a task that would mount
+nothing.
+
 Upstream ships three `task.json` schemas and the generator handles the two that
 are portable. Most tasks carry `work_type` and `tags`; the 498 `contracts` tasks
 carry only `title`, `instructions`, and `criteria`, so their `work_type` line is
@@ -506,4 +602,7 @@ and builds its deliverable map from per-criterion `deliverables` lists, falling
 back to loading all output when a task has none.
 
 Adding an area upstream has not ported before means a `datasets:` entry in
-`config.yaml` (see [Layout](#layout)) and nothing else.
+`config.yaml` (see [Layout](#layout)) and nothing else — unless its tasks share
+a corpus instead of owning their documents, which additionally means an entry in
+`SHARED_CORPUS_AREAS` and a `--mount` at run time (see
+[The shared corpus](#the-shared-corpus)).

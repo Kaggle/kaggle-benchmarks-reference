@@ -7,7 +7,9 @@
 # Differences from upstream:
 #   - No CMD; Harbor manages the container lifecycle.
 #   - Task documents are baked in rather than bind-mounted, because Harbor's
-#     docker build context is the `environment/` directory.
+#     docker build context is the `environment/` directory. The exception is a
+#     shared-corpus area, which mounts instead; the workspace stanza at the
+#     bottom of this file says which applies here.
 #   - `httpx` is added for the verifier's judge, so it can reach ModelProxy
 #     without installing anything at verify time.
 #
@@ -75,10 +77,5 @@ ENV NODE_PATH=/usr/local/lib/node_modules
 COPY parse_doc.py /usr/local/bin/parse-doc
 RUN chmod +x /usr/local/bin/parse-doc
 
-# Workspace layout mirrors the upstream sandbox: documents/ is the read-only
-# input set, output/ is where deliverables land.
-RUN mkdir -p /workspace/documents /workspace/output
-COPY documents/ /workspace/documents/
-RUN chmod -R a-w /workspace/documents
-
+@@DOCUMENTS_STANZA@@
 WORKDIR /workspace

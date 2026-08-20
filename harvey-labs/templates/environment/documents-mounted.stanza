@@ -1,0 +1,13 @@
+# Workspace layout mirrors the upstream sandbox: documents/ is the read-only
+# input set, output/ is where deliverables land. This task's documents are a
+# shared corpus mounted at run time rather than baked in -- the 250
+# firm-knowledge tasks all read one 525 MB corpus, and a self-contained copy
+# per task would cost ~128 GB. See scripts/port_tasks.py:SHARED_CORPUS_AREAS.
+#
+# The symlink dangles at build time and resolves when the runner binds the
+# corpus at the path below. It is created by RUN rather than shipped in the
+# build context because Harbor hashes symlinks without following them and its
+# tar extraction filter rejects them. Read-only comes from the bind itself,
+# which is why there is no chmod here.
+RUN mkdir -p /workspace/output \
+    && ln -s @@CORPUS_MOUNT@@ /workspace/documents

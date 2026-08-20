@@ -12,7 +12,7 @@ __pycache__/
 dataset-metadata.json
 
 # Generated task directories -- 2.9 GB of already-compressed .docx/.xlsx that
-# git cannot pack down, across 67,000 files. They are not committed; the Kaggle
+# git cannot pack down, across 70,000 files. They are not committed; the Kaggle
 # dataset build materializes them with
 #
 #   python3 scripts/port_tasks.py --upstream /path/to/harvey-labs --area all
@@ -21,3 +21,7 @@ dataset-metadata.json
 # templates/ + scripts/ + config.yaml are the tracked source of truth; see the
 # "Adding tasks" section of README.md.
 tasks/
+
+# Assets uploaded to jmasukawa/harvey-lab-task-shared-documents. These get mounted
+# via asset mounts to avoid input duplication when tasks share the same documents.
+assets/
