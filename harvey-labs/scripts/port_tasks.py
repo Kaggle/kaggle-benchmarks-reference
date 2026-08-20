@@ -89,10 +89,17 @@ SKIP_AREAS: frozenset[str] = frozenset()
 SHARED_ASSETS_DATASET = "jmasukawa/harvey-lab-task-shared-documents"
 SHARED_ASSETS_MOUNT = "/kaggle/input/harvey-lab-task-shared-documents"
 
+# Where the hand-written Kaggle metadata lives. Deliberately NOT inside the
+# assets dir: the corpus is staged at the assets root, so anything beside it
+# would be inside the bind mount and would show up in the agent's documents/
+# listing -- while `kaggle datasets create` strips the file from the upload, so
+# the published dataset would not have it. Keeping it out means the staged tree
+# and the dataset are byte-identical. It is copied in at publish time.
+ASSETS_METADATA_DIR = "assets-metadata"
+ASSETS_METADATA_FILE = "dataset-metadata.json"
+
 # Areas whose tasks share one document corpus instead of owning their
-# documents, mapped to the corpus dir below the practice area. That same name
-# is the corpus's dir inside the assets dataset, so one area's corpus cannot
-# collide with another's.
+# documents, mapped to the corpus dir below the practice area.
 #
 # firm-knowledge's 250 tasks own no documents: each sets
 # `docs_dir: "../../dms"` and they all resolve to a single 525 MB / 9,288-file
@@ -113,6 +120,13 @@ SHARED_ASSETS_MOUNT = "/kaggle/input/harvey-lab-task-shared-documents"
 # the baked-in documents of any other area running alongside. The task's
 # Dockerfile symlinks /workspace/documents at this path instead, which keeps
 # DOCUMENTS_PATH in agents/lab_harness/tools.py true for every area.
+#
+# The corpus is staged at the assets root, not in a `dms/` subdir, because
+# `kaggle datasets create --dir-mode zip` archives each top-level dir with
+# `shutil.make_archive(..., root_dir=<dir>)`, which drops the dir's own name:
+# assets/dms/matters/... would publish as matters/... at the dataset root
+# anyway. Staging flat keeps the local mount and the dataset identical instead
+# of quietly diverging. One dataset therefore carries one corpus.
 SHARED_CORPUS_AREAS = {"firm-knowledge": "dms"}
 
 # Path segments to drop when flattening an upstream path into a task slug.
@@ -225,8 +239,15 @@ def sectors_of(parts: tuple[str, ...]) -> list[str]:
 
 
 def corpus_mount(area: str) -> str:
-    """Where a shared-corpus area's documents appear inside the task container."""
-    return f"{SHARED_ASSETS_MOUNT}/{SHARED_CORPUS_AREAS[area]}"
+    """Where a shared-corpus area's documents appear inside the task container.
+
+    The dataset root, since the corpus is staged flat -- see
+    SHARED_CORPUS_AREAS. `area` is taken to keep the call sites honest about
+    which corpus they mean, and to leave room for a per-area path later.
+    """
+    if area not in SHARED_CORPUS_AREAS:
+        raise KeyError(f"{area!r} is not a shared-corpus area")
+    return SHARED_ASSETS_MOUNT
 
 
 def render_dockerfile(templates: Path, *, area: str) -> str:
@@ -479,16 +500,31 @@ def sync_assets(upstream: Path, area: str, assets_dir: Path) -> dict[str, int]:
     binds the same dir, so this is the one place the corpus is materialized
     outside the upstream checkout.
 
-    The corpus goes in `assets/<corpus>/`, not at the root, so that
-    dataset-metadata.json -- untracked, gitignored, and not recreated by
-    anything here -- is a sibling of the synced subtree rather than inside it.
+    The corpus is staged flat -- `assets/matters/...`, not `assets/dms/...` --
+    because `--dir-mode zip` would strip the `dms` level on upload anyway; see
+    SHARED_CORPUS_AREAS. The assets dir therefore holds the corpus and nothing
+    else, and this prunes anything upstream does not account for.
     """
     source = upstream_corpus(upstream / "tasks" / area, area)
-    dest = assets_dir / SHARED_CORPUS_AREAS[area]
+    dest = assets_dir
 
-    # Pruning deletes; make sure it can only ever delete inside the corpus.
-    if dest.resolve() == assets_dir.resolve() or dest.parent != assets_dir:
-        raise SystemExit(f"error: refusing to sync {area!r} corpus to {dest}")
+    # This function deletes. The corpus is the whole of assets/, so the only
+    # thing standing between a mistyped --assets and a wiped directory is this.
+    if dest.resolve() in (REPO_ROOT, *REPO_ROOT.parents):
+        raise SystemExit(
+            f"error: refusing to sync {area!r} corpus to {dest} -- it contains "
+            f"the repo, and syncing prunes everything it does not own"
+        )
+
+    # A metadata file left here by an older layout is the one thing in this dir
+    # that is hand-written and unrecoverable. Refuse rather than prune it.
+    if (dest / ASSETS_METADATA_FILE).exists():
+        raise SystemExit(
+            f"error: {dest / ASSETS_METADATA_FILE} is inside the staged corpus, "
+            f"where it would be pruned and would leak into the agent's "
+            f"documents/ listing. Move it to {REPO_ROOT / ASSETS_METADATA_DIR} "
+            f"and re-run; see 'Publishing the corpus' in README.md"
+        )
 
     counts = {"added": 0, "updated": 0, "removed": 0, "unchanged": 0}
     dest.mkdir(parents=True, exist_ok=True)
@@ -512,8 +548,8 @@ def sync_assets(upstream: Path, area: str, assets_dir: Path) -> dict[str, int]:
         shutil.copy2(src, target)
         counts[key] += 1
 
-    # Anything upstream dropped. Files first, then the dirs they emptied --
-    # deepest first, so a pruned leaf lets its parent go in the same pass.
+    # Anything upstream dropped. Deepest first, so a pruned leaf lets its
+    # parent go in the same pass.
     stale = sorted(
         (p for p in dest.rglob("*") if p.relative_to(dest) not in wanted),
         key=lambda p: len(p.parts),
@@ -622,19 +658,19 @@ def main() -> int:
 
     for shared in shared_areas:
         if args.sync_assets:
-            dest = args.assets / SHARED_CORPUS_AREAS[shared]
-            print(f"\n  syncing {shared} corpus -> {dest}")
+            print(f"\n  syncing {shared} corpus -> {args.assets}")
             counts = sync_assets(args.upstream, shared, args.assets)
-            n_files = sum(1 for p in dest.rglob("*") if p.is_file())
-            mib = sum(p.stat().st_size for p in dest.rglob("*") if p.is_file()) / 2**20
-            print(f"    {n_files} file(s), {mib:.1f} MiB")
+            staged = [p for p in args.assets.rglob("*") if p.is_file()]
+            mib = sum(p.stat().st_size for p in staged) / 2**20
+            print(f"    {len(staged)} file(s), {mib:.1f} MiB")
             print("    " + ", ".join(f"{v} {k}" for k, v in counts.items()))
-            # The one file the sync will not create, and `kaggle datasets
-            # create` refuses to run without it.
-            if not (args.assets / "dataset-metadata.json").exists():
+            # The one file no generator recreates, and `kaggle datasets create`
+            # refuses to run without it.
+            metadata = REPO_ROOT / ASSETS_METADATA_DIR / ASSETS_METADATA_FILE
+            if not metadata.exists():
                 print(
-                    f"    note: {args.assets}/dataset-metadata.json is missing; "
-                    f"write one for {SHARED_ASSETS_DATASET} before publishing"
+                    f"    note: {metadata} is missing; write one for "
+                    f"{SHARED_ASSETS_DATASET} before publishing"
                 )
 
         # A shared-corpus area ships no documents, so its tasks are inert until

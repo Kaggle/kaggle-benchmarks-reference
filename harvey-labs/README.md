@@ -80,9 +80,9 @@ harvey-labs/
 │   ├── tools.py                   #   the six tools
 │   ├── adapters/                  #   per-provider model adapters
 │   └── assets/                    #   system prompt + docx/pptx/xlsx skills
+├── assets-metadata/               # Kaggle dataset id (hand-written, tracked)
 ├── assets/                        # staged shared corpus, generated, not committed
-│   ├── dataset-metadata.json      #   Kaggle dataset id (hand-written)
-│   └── dms/                       #   firm-knowledge corpus; see The shared corpus
+│   └── matters/                   #   firm-knowledge corpus; see The shared corpus
 └── tasks/<legal-practice-area>/<task>/    # generated, not committed
     ├── task.toml                  # Harbor task config
     ├── instruction.md             # what the agent is told
@@ -187,8 +187,8 @@ Two details are deliberate:
   alongside. The image symlinks `/workspace/documents` at the mount instead,
   which keeps `DOCUMENTS_PATH` in `agents/lab_harness/tools.py` true for all 27
   areas. The path is `/kaggle/input/<dataset-slug>`, matching where Kaggle
-  mounts an attached dataset, and the corpus sits one level below it in `dms/`
-  so a second shared corpus could join the same dataset later.
+  mounts an attached dataset, and the corpus is the dataset root — see
+  [Publishing the corpus](#publishing-the-corpus) for why it is not nested.
 - **The symlink is created by `RUN`, not shipped in the build context.** Harbor
   hashes symlinks without following them and its tar extraction filter rejects
   them. It dangles at build time and resolves when the corpus is bound.
@@ -210,18 +210,40 @@ local run:
 # Copy new/changed documents in, delete ones upstream dropped.
 python3 scripts/port_tasks.py --area firm-knowledge --sync-assets
 
-kaggle datasets create -p assets --dir-mode zip     # or `version -p assets`
+# The CLI requires the metadata inside the upload folder (there is no -m flag),
+# so borrow it for the upload and take it back out afterwards.
+cp assets-metadata/dataset-metadata.json assets/
+kaggle datasets version -p assets --dir-mode zip -m "sync to <commit>"
+rm assets/dataset-metadata.json
 ```
 
-Two things about `assets/`:
+Use `create` instead of `version` for the initial upload.
 
-- **`dataset-metadata.json` is hand-written and not tracked.** `assets/` is
-  gitignored, the sync never creates or deletes this file (it prunes only
-  `assets/dms/`), and the Kaggle CLI strips it from the upload rather than
-  publishing it. If it goes missing the generator says so; recreate it with the
-  id in `scripts/port_tasks.py:SHARED_ASSETS_DATASET`.
-- **`--dir-mode zip`** uploads each top-level dir as one archive, which Kaggle
-  expands on attach. Without it the 9,288 files are skipped entirely.
+Three things about `assets/`:
+
+- **`--dir-mode zip` is required, and it drops one level of nesting.** Without
+  it the CLI skips directories entirely and uploads nothing. With it, each
+  top-level dir is archived by
+  `shutil.make_archive(base, "zip", root_dir=<that dir>)`, which does *not*
+  include the dir's own name — so `assets/dms/matters/…` publishes as
+  `matters/…` at the dataset root. **This is why the corpus is staged flat**
+  (`assets/matters/…`) rather than under `assets/dms/`: the flat layout is what
+  Kaggle ends up with either way, and staging it flat keeps the local mount and
+  the published dataset byte-identical instead of quietly diverging. Adding
+  sibling files does not change this; the stripping happens when the archive is
+  built, before Kaggle sees it.
+- **`dataset-metadata.json` lives outside `assets/`, in `assets-metadata/`.**
+  `assets/` is the bind-mount source, so anything staged beside `matters/`
+  would appear in the agent's `documents/` listing — while the CLI strips the
+  metadata from the upload, so Kaggle would *not* have it. Keeping it out means
+  the staged tree and the published dataset are byte-identical (9,288 files
+  either way). It is the one hand-written, non-regenerable file in this flow,
+  so unlike every other `dataset-metadata.json` it *is* tracked (see the
+  negation in `.gitignore`). The sync refuses to run if a copy is left inside
+  `assets/`, rather than pruning it.
+- **One dataset carries one corpus.** A flat root leaves no room to namespace a
+  second one, so a future shared-corpus area wants its own dataset and its own
+  entry in `SHARED_CORPUS_AREAS`.
 
 Keep the corpus pinned to the same `SOURCE_COMMIT` as the task tree — the
 rubrics name specific matter numbers, so a corpus and a rubric set from

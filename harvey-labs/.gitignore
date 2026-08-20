@@ -11,6 +11,12 @@ __pycache__/
 # Kaggle dataset CLI file
 dataset-metadata.json
 
+# ...except the shared-corpus one. It is hand-written, is the only thing in the
+# publish flow no generator can recreate, and is kept outside assets/ so the
+# corpus staged there is byte-identical to the published dataset. It is copied
+# into assets/ at publish time; see "Publishing the corpus" in README.md.
+!assets-metadata/dataset-metadata.json
+
 # Generated task directories -- 2.9 GB of already-compressed .docx/.xlsx that
 # git cannot pack down, across 70,000 files. They are not committed; the Kaggle
 # dataset build materializes them with
@@ -25,3 +31,4 @@ tasks/
 # Assets uploaded to jmasukawa/harvey-lab-task-shared-documents. These get mounted
 # via asset mounts to avoid input duplication when tasks share the same documents.
 assets/
+assets-metadata/
