@@ -1,0 +1,5 @@
+# Workspace layout mirrors the upstream sandbox: documents/ is the read-only
+# input set, output/ is where deliverables land.
+RUN mkdir -p /workspace/documents /workspace/output
+COPY documents/ /workspace/documents/
+RUN chmod -R a-w /workspace/documents

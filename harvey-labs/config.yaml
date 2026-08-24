@@ -48,10 +48,14 @@ agents:
 # would find only the practice-area dirs, none of which has a task.toml, and
 # silently yield zero tasks.
 #
-# 1,760 tasks across 26 areas. Running all of them is on the order of 112,000
-# judge calls; scope a run with `harbor run -p tasks/<area>` or a trimmed copy
-# of this list. Upstream's 27th area, firm-knowledge, is not ported -- see
-# scripts/port_tasks.py:SKIP_AREAS.
+# 2,010 tasks across all 27 areas. Running all of them is on the order of
+# 114,000 judge calls; scope a run with `harbor run -p tasks/<area>` or a
+# trimmed copy of this list.
+#
+# firm-knowledge is the one area whose tasks ship no documents of their own --
+# all 250 read one shared corpus, bind-mounted read-only at run time. Its
+# tasks fail without that mount; see scripts/port_tasks.py:SHARED_CORPUS_AREAS
+# and the README.
 #
 # tasks/ is gitignored and generated. Run
 #   python3 scripts/port_tasks.py --upstream /path/to/harvey-labs --area all
@@ -71,6 +75,8 @@ datasets:
   - path: tasks/employment-labor
   - path: tasks/energy-natural-resources
   - path: tasks/environmental-esg
+  # Requires the shared corpus mounted; see The shared corpus in README.md.
+  - path: tasks/firm-knowledge
   - path: tasks/funds-asset-management
   - path: tasks/healthcare-life-sciences
   - path: tasks/immigration

@@ -16,9 +16,10 @@ model traffic through Kaggle's ModelProxy instead of vendor APIs.
 
 Upstream reference commit: 55510f0e609ffa5cf6f5df17d9a813ce4bb33d0c
 
-Scope: 1,760 tasks across 26 of upstream's 27 practice areas. The 27th,
-firm-knowledge, is not ported -- its tasks share a single document corpus that
-a self-contained Harbor task directory cannot express.
+Scope: 2,010 tasks across all 27 of upstream's practice areas. The 250
+firm-knowledge tasks share a single document corpus rather than owning their
+documents; that corpus is bind-mounted into the task container at run time and
+is redistributed as a separate Kaggle dataset under the same MIT license.
 
 
 Verbatim copies from harvey-labs (MIT, (c) 2026 Harvey AI)
@@ -55,6 +56,11 @@ tasks/** paths describe what a generated tree contains.
 
     tasks/**/environment/documents/
 
+    the firm-knowledge shared corpus
+        <- tasks/firm-knowledge/dms/
+        redistributed as its own Kaggle dataset rather than copied into each
+        of the 250 tasks that read it
+
     tasks/**/environment/parse_doc.py
         <- sandbox/parsers/parse_doc.py
 
@@ -75,8 +81,9 @@ comparable to any published Harvey LAB results:
                                       aggregation, JUDGE_MODELS),
                                       evaluation/report.py (strict-AND merged
                                       per-criterion view)
-    templates/environment/Dockerfile  <- sandbox/Dockerfile
-    (and tasks/**/environment/Dockerfile)
+    templates/environment/Dockerfile.tmpl  <- sandbox/Dockerfile
+    (+ documents-{baked,mounted}.stanza,
+     rendered to tasks/**/environment/Dockerfile)
 
 Known intentional deviations from upstream are documented in README.md.
 
