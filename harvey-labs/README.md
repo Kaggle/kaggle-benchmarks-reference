@@ -249,6 +249,69 @@ Keep the corpus pinned to the same `SOURCE_COMMIT` as the task tree — the
 rubrics name specific matter numbers, so a corpus and a rubric set from
 different upstream commits will silently mis-grade rather than fail.
 
+## Publishing the task dataset
+
+The task tree publishes to `jmasukawa/harvey-lab-harbor-kaggle-port` from the
+repo root — the upload folder is the working copy itself, which is what makes
+the exclusions below load-bearing rather than cosmetic. Materialize `tasks/`
+first (see [Adding tasks](#adding-tasks)); it is generated and not committed, so
+a fresh clone would otherwise publish an empty benchmark.
+
+```bash
+kaggle datasets version -p . --dir-mode zip \
+  --ignore-patterns '.env'   --ignore-patterns '*/.env' \
+  --ignore-patterns '.env.*' --ignore-patterns '*/.env.*' \
+  --ignore-patterns 'jobs/'  --ignore-patterns 'results/' \
+  --ignore-patterns 'assets/' --ignore-patterns 'assets-metadata/' \
+  --ignore-patterns '__pycache__/' --ignore-patterns '*/__pycache__/' \
+  --ignore-patterns '*.pyc' \
+  -m "port at <commit>"
+```
+
+Use `create` instead of `version` for the initial upload; both accept the same
+flags. `--dir-mode zip` is required for the same reason as the corpus — without
+it the CLI skips directories and uploads only the loose files at the root.
+
+What each exclusion is for: `jobs/` and `results/` are local run output
+(`jobs_dir` in `config.yaml`), which is both large and irrelevant to a consumer
+of the dataset; `assets/` and `assets-metadata/` belong to the *other* dataset
+and are mounted, not bundled, so shipping them here would duplicate 525 MB and
+diverge from the mount; `__pycache__/` and `*.pyc` are build droppings. The
+`.env` patterns are the ones that matter — see below.
+
+### Keeping `.env` out of an upload
+
+**This cannot be expressed in `dataset-metadata.json`.** The CLI reads only
+`id`, `id_no`, `title`, `licenses`, `subtitle`, `description`, `keywords`, and
+`resources` from that file; there is no ignore or exclude key. The only paths it
+drops implicitly are the metadata files themselves and the cover images. Nor is
+there a `.kaggleignore` — `.gitignore` has no bearing on what gets uploaded,
+which is exactly the trap, since `.env` is gitignored and therefore invisible in
+`git status` while sitting in the upload root beside `dataset-metadata.json`.
+
+It *is* expressible as a CLI flag. `kaggle datasets create` and `kaggle datasets
+version` both take `--ignore-patterns` (Kaggle CLI 2.2.4). Two things about how
+it matches, both of which explain why one pattern is not enough:
+
+- **It is `fnmatch` against the relative path, not gitignore syntax.** `*`
+  crosses `/`. A bare `.env` matches only at the scan root, so `*/.env` is
+  needed for any nested copy, and `.env.*` / `*/.env.*` for variants like
+  `.env.local`. Directory patterns need a trailing slash — `jobs` matches
+  nothing, `jobs/` prunes the tree.
+- **The flag is `action="append"`, and does not split on commas.** Each pattern
+  needs its own `--ignore-patterns`. Passing `'.env,jobs/'` silently matches a
+  file literally named `.env,jobs/` and excludes nothing.
+
+The upload walks the root by basename and each `--dir-mode zip` archive by path
+relative to *that* directory, which is why both the bare and the `*/`-prefixed
+forms appear in the commands above.
+
+> **A published `.env` is a leaked credential, not a stray file.** The one in
+> this repo carries `MODEL_PROXY_API_KEY`. Deleting the file and pushing a new
+> version does not unpublish it — prior versions stay downloadable, so the key
+> has to be rotated. Check what a dataset actually contains with
+> `kaggle datasets files <owner>/<slug>` before assuming it is clean.
+
 ## Environment variables
 
 **Nothing in this repository builds a model URL.** Both the agent and the judge

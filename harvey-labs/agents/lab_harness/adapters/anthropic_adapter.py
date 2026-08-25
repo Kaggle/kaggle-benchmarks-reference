@@ -41,14 +41,20 @@ ADAPTIVE_MODELS = (
     "claude-opus-4-6",
     "claude-opus-4-7",
     "claude-opus-4-8",
+    "claude-opus-5",
     "claude-sonnet-4-6",
     "claude-sonnet-5",
 )
 
+# Models that reject `temperature` outright -- sending it is a 400, not a
+# silently ignored field, so the whole run dies on the first turn. Keep this in
+# step with MAX_OUTPUT below: a model new enough to need an entry there is new
+# enough to belong here.
 NO_TEMPERATURE_MODELS = (
     "claude-fable-5",
     "claude-opus-4-7",
     "claude-opus-4-8",
+    "claude-opus-5",
     "claude-sonnet-4-7",
     "claude-sonnet-5",
 )
