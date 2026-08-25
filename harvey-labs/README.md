@@ -438,6 +438,25 @@ Set on the agent via `--ae KEY=VALUE`:
 | `LAB_TEMPERATURE`      | `0.0`   | Sampling temperature                                |
 | `LAB_SHELL_TIMEOUT`    | `60`    | Per-`bash`-call timeout, seconds                    |
 | `LAB_REASONING_EFFORT` | unset   | Enables adaptive thinking on models that support it |
+| `LAB_MAX_TOKENS`       | unset   | Per-turn output ceiling; unset uses the model's max |
+
+`LAB_MAX_TOKENS` exists for cost, not capability. Unset, each adapter asks for its
+model's full ceiling — 128k on the Anthropic and OpenAI/xAI paths, 64k on Gemini.
+Kaggle's ModelProxy reserves quota from that number *before* the model runs and does
+so on every turn, so a 200-turn run at 128k reserves ~$3.46 two hundred times and can
+exhaust a day's quota in a few runs, surfacing as
+`403 max estimated cost of operation ($N) exceeds your available quota`.
+
+`65536` is the recommended value for a sweep: it halves the Anthropic/OpenAI
+reservation and is a no-op for Gemini. Measured against 23 transcripts from the
+white-collar sweep, the largest single response was **38,123 tokens** — 65,536
+truncates none of them, 32,768 truncates 3, and 16,384 truncates 17. On the OpenAI
+path the ceiling bounds reasoning *and* visible output together, so leave more
+headroom there than the raw output figures suggest.
+
+Every adapter logs a `Response truncated (…)` warning to `trial.log` when a turn hits
+the ceiling, and carries on with what the turn produced — a truncated answer is still
+scored, so grep for that warning before trusting a run made with a low cap.
 
 Verifier-side, via the host environment (templated in `task.toml`):
 
@@ -501,7 +520,8 @@ unmodified. `MODEL_CONNECTION` is deliberately left unset on the agent class so
 run metadata still reports a Grok run's provider as `xai` rather than `openai`.
 
 No adapter keeps a model allowlist: the prefix picks the SDK, and any model the
-endpoint serves works. Per-model tables tune `max_tokens` and reasoning, but an
+endpoint serves works. Per-model tables tune `max_tokens` and reasoning (and
+`LAB_MAX_TOKENS` overrides the former for every model at once), but an
 unrecognized id is still dispatched. An unprefixed name is inferred from the id
 (`claude*`, `gpt*`/`o1`/`o3`/`o4`, `gemini*`, `grok*`).
 

@@ -30,6 +30,7 @@ the wire unchanged and works on both 0.x and 1.x.
 """
 
 import json
+import logging
 
 import anthropic
 
@@ -87,9 +88,12 @@ class AnthropicAdapter(ModelAdapter):
         max_tokens: int | None = None,
         reasoning_effort: str | None = None,
         max_retries: int = 3,
+        logger: logging.Logger | None = None,
     ):
-        super().__init__(model, temperature, reasoning_effort)
-        # Default to the model's maximum output capacity.
+        super().__init__(model, temperature, reasoning_effort, logger)
+        # Default to the model's maximum output capacity. An explicit
+        # `max_tokens` -- LAB_MAX_TOKENS, see agent.py -- overrides the table;
+        # the truncation warning in `chat` is what makes a too-low one visible.
         if max_tokens is None:
             max_tokens = next(
                 (v for k, v in self.MAX_OUTPUT.items() if model.startswith(k)),
@@ -157,6 +161,19 @@ class AnthropicAdapter(ModelAdapter):
         # Always stream to avoid SDK timeout on large responses.
         with self.client.messages.stream(**kwargs) as stream:
             response = stream.get_final_message()
+
+        # Warn, don't raise: the turn is cut short but what it produced is
+        # still usable, and the loop is free to carry on. judge.py raises on
+        # the same stop_reason because a truncated verdict cannot be parsed at
+        # all -- a different situation. Silence is the thing to avoid: without
+        # this, a LAB_MAX_TOKENS set too low degrades every answer invisibly.
+        if response.stop_reason == "max_tokens":
+            self.logger.warning(
+                "Response truncated (stop_reason=max_tokens, "
+                "output_tokens=%s, max_tokens=%s). Raise LAB_MAX_TOKENS.",
+                response.usage.output_tokens,
+                self.max_tokens,
+            )
 
         tool_calls = []
         text_parts = []

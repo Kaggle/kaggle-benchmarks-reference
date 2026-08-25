@@ -244,12 +244,22 @@ class LABHarnessAgent(BaseAgent):
         reasoning_effort = self._get_env(
             "LAB_REASONING_EFFORT", "KAGGLE_AGENT_LLM_REASONING_EFFORT"
         )
+        # Unset (or 0, which is not a meaningful ceiling) leaves every adapter
+        # on its own per-model maximum, so the default is exactly what it was.
+        #
+        # Worth setting when the base URL is Kaggle's ModelProxy: it reserves
+        # quota per turn off this number *before* the model runs, so a 128k
+        # ceiling reserves ~$3.46 a turn whether or not the turn is long. See
+        # the note in openai_adapter.py's MAX_OUTPUT.
+        max_tokens = self._int_env("LAB_MAX_TOKENS", 0) or None
         adapter = create_adapter(
             model_name=model_name,
             api_key=conn.api_key,
             base_url=conn.configured_base_url,
             temperature=temperature,
+            max_tokens=max_tokens,
             reasoning_effort=reasoning_effort or None,
+            logger=self.logger,
         )
 
         # System prompt: workspace/tool conventions + skill manuals. Task
@@ -272,10 +282,13 @@ class LABHarnessAgent(BaseAgent):
             logger=self.logger,
         )
 
+        # `adapter.max_tokens`, not the env value: this reports the ceiling
+        # actually in force, including the per-model default when unset.
         self.logger.debug(
-            "LAB harness: model=%s turns<=%d tools=%s skills=%s",
+            "LAB harness: model=%s turns<=%d max_tokens=%d tools=%s skills=%s",
             model_name,
             max_turns,
+            adapter.max_tokens,
             ",".join(t["name"] for t in tools),
             ",".join(skill_names),
         )

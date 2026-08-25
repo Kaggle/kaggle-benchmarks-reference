@@ -29,6 +29,7 @@ do exactly that, because upstream's driver hands them only the newest turn;
 see README deviation #14.
 """
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
@@ -68,10 +69,18 @@ class ModelAdapter(ABC):
         model: str,
         temperature: float = 0.0,
         reasoning_effort: str | None = None,
+        logger: logging.Logger | None = None,
     ):
         self.model = model
         self.temperature = temperature
         self.reasoning_effort = reasoning_effort  # "low" | "medium" | "high" | None
+        # Pass the trial's logger in, don't reach for a module-level one.
+        # Harbor hangs the per-trial FileHandler off `global_logger`'s child
+        # tree (harbor/trial/trial.py:_init_logger), so a logger named
+        # `agents.lab_harness.*` is outside it: its records never reach
+        # trial.log and fall through to logging.lastResort on stderr. The
+        # fallback here only exists so `self.logger` is never None off-Harbor.
+        self.logger = logger or logging.getLogger(__name__)
 
     @abstractmethod
     def chat(self, messages: list[dict], tools: list[dict]) -> ModelResponse:

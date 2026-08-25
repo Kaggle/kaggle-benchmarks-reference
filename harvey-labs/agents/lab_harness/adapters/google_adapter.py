@@ -43,6 +43,7 @@ Two divergences from upstream that must not be "synced back":
 """
 
 import json
+import logging
 
 from google import genai
 from google.genai import types
@@ -102,8 +103,9 @@ class GoogleAdapter(ModelAdapter):
         max_tokens: int | None = None,
         reasoning_effort: str | None = None,
         max_retries: int = 3,
+        logger: logging.Logger | None = None,
     ):
-        super().__init__(model, temperature, reasoning_effort)
+        super().__init__(model, temperature, reasoning_effort, logger)
         if max_tokens is None:
             max_tokens = next(
                 (v for k, v in self.MAX_OUTPUT.items() if model.startswith(k)),
@@ -188,6 +190,24 @@ class GoogleAdapter(ModelAdapter):
             )
 
         response, content = self._generate(contents, config)
+
+        # A truncated Gemini turn still carries parts, so `_candidate` -- which
+        # only rejects an *empty* candidate -- passes it straight through. Warn
+        # here rather than there for that reason: this is the non-empty case,
+        # and it is otherwise completely silent. Same enum-by-name comparison
+        # `_candidate` uses; judge.py checks the identical finish_reason.
+        candidate = (response.candidates or [None])[0]
+        finish = getattr(getattr(candidate, "finish_reason", None), "name", None)
+        if finish == "MAX_TOKENS":
+            usage = response.usage_metadata
+            self.logger.warning(
+                "Response truncated (finish_reason=MAX_TOKENS, "
+                "output_tokens=%s, max_output_tokens=%s). Raise "
+                "LAB_MAX_TOKENS. Note thinking tokens are counted against "
+                "this ceiling but are not in the reported output count.",
+                (usage.candidates_token_count if usage else None),
+                self.max_tokens,
+            )
 
         tool_calls = []
         text_parts = []

@@ -24,6 +24,8 @@ base URL from ``agent.py`` and hands both to its vendor SDK; where those come
 from is the environment's business.
 """
 
+import logging
+
 from .base import ModelAdapter, ModelResponse, ToolCall
 
 __all__ = [
@@ -82,7 +84,9 @@ def create_adapter(
     api_key: str | None = None,
     base_url: str | None = None,
     temperature: float = 0.0,
+    max_tokens: int | None = None,
     reasoning_effort: str | None = None,
+    logger: logging.Logger | None = None,
 ) -> ModelAdapter:
     """Build the adapter for ``model_name``.
 
@@ -93,6 +97,11 @@ def create_adapter(
         base_url: The API root to talk to -- Kaggle's ModelProxy on Kaggle,
             whatever the environment says elsewhere. ``None`` leaves the SDK to
             its own vendor default.
+        max_tokens: Per-turn output ceiling. ``None`` leaves each adapter on
+            its own per-model maximum, which is the default; a value here is
+            the ``LAB_MAX_TOKENS`` override.
+        logger: The trial's logger, so adapter warnings reach ``trial.log``.
+            ``None`` falls back to a module logger -- see ``base.py``.
     """
     provider, model = split_model_name(model_name)
 
@@ -129,5 +138,7 @@ def create_adapter(
         api_key=api_key,
         base_url=base_url,
         temperature=temperature,
+        max_tokens=max_tokens,
         reasoning_effort=reasoning_effort,
+        logger=logger,
     )

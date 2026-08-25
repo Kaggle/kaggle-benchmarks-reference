@@ -39,6 +39,8 @@ Verified on Grok as well: replaying its ``reasoning`` items verbatim across a
 tool-calling turn is accepted.
 """
 
+import logging
+
 import openai
 
 from .base import ModelAdapter, ModelResponse, ToolCall
@@ -84,8 +86,11 @@ class OpenAIAdapter(ModelAdapter):
     # prices a cost reservation off this number before it runs anything, so a
     # depleted quota surfaces as
     # 403 "max estimated cost of operation ($N) exceeds your available quota"
-    # rather than as anything wrong with the request. That is an environment
-    # condition to wait out, not a reason to shrink the cap.
+    # rather than as anything wrong with the request. The reservation is per
+    # *turn*, so a 200-turn run at this ceiling reserves against it 200 times
+    # -- enough to exhaust a day's quota on a handful of runs. Set
+    # LAB_MAX_TOKENS to trade headroom for throughput when that bites; the
+    # tables here stay at each model's true ceiling so the default is lossless.
     # grok-4.5 lands on the same 128000 via the fallback; it is spelled out
     # here for the same reason the Anthropic table enumerates known ids, and
     # because its 500k context leaves plenty of room for this ceiling.
@@ -103,8 +108,9 @@ class OpenAIAdapter(ModelAdapter):
         max_tokens: int | None = None,
         reasoning_effort: str | None = None,
         max_retries: int = 3,
+        logger: logging.Logger | None = None,
     ):
-        super().__init__(model, temperature, reasoning_effort)
+        super().__init__(model, temperature, reasoning_effort, logger)
         if max_tokens is None:
             max_tokens = next(
                 (v for k, v in self.MAX_OUTPUT.items() if model.startswith(k)),
@@ -162,10 +168,28 @@ class OpenAIAdapter(ModelAdapter):
         if response.status == "incomplete":
             details = response.incomplete_details
             reason = getattr(details, "reason", None) or "unknown"
-            raise RuntimeError(
-                f"Responses API returned an incomplete response "
-                f"(reason={reason}, max_output_tokens={self.max_tokens})"
-            )
+            # Hitting the ceiling is a tuning outcome, not a failure: warn and
+            # keep whatever the turn produced. Raising was right while the cap
+            # was always the model's own maximum -- nothing the operator could
+            # do about it -- but LAB_MAX_TOKENS makes it a deliberate setting,
+            # and loop.py re-raises anything that is not a context-overflow
+            # marker, so a raise here would kill the run outright.
+            #
+            # Every other reason (content_filter, and whatever the API adds)
+            # still raises: those are not something a cap explains.
+            if reason == "max_output_tokens":
+                self.logger.warning(
+                    "Response truncated (status=incomplete, "
+                    "reason=max_output_tokens, max_output_tokens=%s). "
+                    "Raise LAB_MAX_TOKENS. Note this ceiling bounds reasoning "
+                    "and visible output together.",
+                    self.max_tokens,
+                )
+            else:
+                raise RuntimeError(
+                    f"Responses API returned an incomplete response "
+                    f"(reason={reason}, max_output_tokens={self.max_tokens})"
+                )
         if response.error:
             raise RuntimeError(f"Responses API error: {response.error}")
 
