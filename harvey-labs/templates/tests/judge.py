@@ -1,11 +1,13 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#   "httpx>=0.27",
-#   "pandas>=2.0",
-#   "openpyxl>=3.1",
-#   "pdfplumber>=0.11",
+#   "anthropic>=0.102,<2",
+#   "google-genai>=1.70",
 #   "markitdown>=0.1",
+#   "openai>=2.0",
+#   "openpyxl>=3.1",
+#   "pandas>=2.0",
+#   "pdfplumber>=0.11",
 # ]
 # ///
 #
@@ -44,17 +46,22 @@ identical to upstream:
     the task reward is their mean, so a split decision scores 0.5. This is
     upstream's ``dual_all_pass_rate``. Off by default; see ``--models``.
 
-Differences from original benchmark implementation: requests go to ModelProxy
-over httpx rather than to the vendor APIs via their SDKs, the OpenAI judge
-omits ``temperature`` (ModelProxy rejects it for gpt-5.x), the judges share
-one extraction pass and one thread pool rather than running sequentially, and
-the 4th-stage LLM deliverable matcher is omitted (see ``_match_deliverables``).
+Models are reached through their own vendor SDKs, at whatever base URL the
+environment supplies -- Kaggle's ModelProxy on Kaggle, the real vendors
+elsewhere. Nothing here builds a URL; see ``_env`` for the variables read.
+
+Differences from original benchmark implementation: the OpenAI judge omits
+``temperature`` (ModelProxy rejects it for gpt-5.x), the judges share one
+extraction pass and one thread pool rather than running sequentially, a Google
+judge is available (upstream has none), and the 4th-stage LLM deliverable
+matcher is omitted (see ``_match_deliverables``).
 
 The term "upstream" used below is a reference to the original benchmark
 implementation, given this one is derived.
 """
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -65,31 +72,40 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-import httpx
-
-ANTHROPIC_VERSION = "2023-06-01"
 # Overridable only so the truncation branch can be exercised in testing; the
 # shipped value is from the original benchmark implementation.
 MAX_TOKENS = int(os.environ.get("JUDGE_MAX_TOKENS", "16384"))
-TEMPERATURE = 0.0  # Anthropic only -- see OpenAIJudge._payload.
+TEMPERATURE = 0.0  # Not sent by the OpenAI judge -- see OpenAIJudge._call.
 _RETRIES = 2
-_HTTP_RETRIES = 3
-_RETRY_STATUSES = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
+# Handed to each SDK, which owns the backoff. Counts retries, not attempts.
+#
+# Five, not the 1-2 the vendor defaults use: JUDGE_PARALLEL puts eight
+# criteria in flight at once against one model, and a rubric this size will
+# draw a 429 from a throttled endpoint somewhere in the run. Every SDK here
+# backs off exponentially, so the extra attempts cost nothing when nothing is
+# throttling. An exhausted ladder is not a soft failure -- it scores that
+# criterion as an error and drags the reward down.
+_HTTP_RETRIES = 5
 
 DEFAULT_JUDGE_MODEL = "claude-sonnet-4-6"
-# Upstream's second judge (evaluation/run_eval.py:29), unprefixed as upstream
-# spells it -- ModelProxy's /openapi route serves the bare id, so the dual
-# line-up is model-identical to upstream's.
 DEFAULT_OPENAI_JUDGE = "gpt-5.5"
 
-# provider -> ModelProxy path suffix. Duplicated from the agent's
-# adapters/__init__.py rather than imported: Harbor uploads tests/ into the
-# container on its own, so this file has to stand alone.
-#
-# The agent's map additionally carries `google -> genai`. That divergence is
-# deliberate, not drift: judging is only ever done by Anthropic and OpenAI
-# models, so there is no Gemini judge path to keep in sync.
-_PROXY_PATHS = {"anthropic": "anthropic", "openai": "openapi"}
+
+def _env(*names: str) -> str | None:
+    """First non-empty value among ``names``.
+
+    Empty string, not absent, is the common case: task.toml's [verifier.env]
+    forwards every name with a ``:-`` default (harbor's resolve_env_vars
+    raises on a bare ``${VAR}``), so an unset host variable arrives here as
+    "". That matters because ``openai.OpenAI(api_key="")`` and
+    ``genai.Client(api_key="")`` behave differently from the ``None`` that
+    means "fall back to your own default".
+    """
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None
 
 _VERDICT_SCHEMA = {
     "type": "object",
@@ -293,38 +309,25 @@ class RubricResult:
 
 
 class Judge:
-    """LLM-as-judge calling models through Kaggle's ModelProxy.
+    """LLM-as-judge, calling one provider's API through its own SDK.
 
     The retry ladder, the schema-drop-on-last-attempt policy, and the JSON
-    extraction are shared; subclasses supply the endpoint, the request body,
-    and how to pull text back out of the response.
+    extraction are shared; subclasses build their own client, make the call,
+    and say how to pull text back out of the response.
     """
 
     provider = ""
-    endpoint = ""
 
-    def __init__(self, model: str, base_url: str, api_key: str):
+    def __init__(self, model: str):
         self.model = model
-        self.client = httpx.Client(
-            base_url=base_url.rstrip("/"),
-            headers={
-                # ModelProxy authenticates with a bearer token, not X-Api-Key.
-                "Authorization": f"Bearer {api_key}",
-                "content-type": "application/json",
-                **self._extra_headers(),
-            },
-            timeout=httpx.Timeout(connect=30.0, read=600.0, write=120.0, pool=30.0),
-        )
 
     # -- Provider hooks ---------------------------------------------------
 
-    def _extra_headers(self) -> dict:
-        return {}
-
-    def _payload(self, prompt: str, *, structured: bool) -> dict:
+    def _call(self, prompt: str, *, structured: bool):
+        """Issue one request and return the SDK's response object."""
         raise NotImplementedError
 
-    def _extract_text(self, response: dict) -> str:
+    def _extract_text(self, response) -> str:
         """Pull the model's text out, raising if the response was truncated."""
         raise NotImplementedError
 
@@ -335,12 +338,10 @@ class Judge:
         last_err: Exception | None = None
 
         for attempt in range(_RETRIES):
-            # Constrain to the verdict schema on early attempts; drop it on
-            # the last so a schema-path 5xx can still produce a verdict.
-            payload = self._payload(prompt, structured=attempt < _RETRIES - 1)
-
             try:
-                response = self._post(payload)
+                # Constrain to the verdict schema on early attempts; drop it
+                # on the last so a schema-path 5xx can still produce a verdict.
+                response = self._call(prompt, structured=attempt < _RETRIES - 1)
             except Exception as e:
                 last_err = e
                 continue
@@ -358,39 +359,22 @@ class Judge:
         )
 
     def preflight(self) -> None:
-        """Prove the route and model id are live, with one tiny call.
+        """Prove the endpoint and model id are live, with one tiny call.
 
-        An unroutable model returns 503, which is in ``_RETRY_STATUSES`` and so
-        is indistinguishable from a transient outage: without this probe a
+        An unroutable model returns 503, which the SDKs treat as retryable and
+        so is indistinguishable from a transient outage: without this probe a
         misconfigured judge burns its whole retry ladder on every criterion
         and then records them all as failures, quietly halving a dual reward.
         """
         prompt = 'Reply with JSON only: {"verdict": "pass", "reasoning": "ok"}'
-        payload = self._payload(prompt, structured=True)
-        self._parse_json(self._extract_text(self._post(payload)))
+        self._parse_json(self._extract_text(self._call(prompt, structured=True)))
 
     def close(self) -> None:
-        self.client.close()
-
-    def _post(self, payload: dict) -> dict:
-        last_err: Exception | None = None
-        for attempt in range(_HTTP_RETRIES + 1):
-            try:
-                response = self.client.post(self.endpoint, json=payload)
-                if response.status_code == 200:
-                    return response.json()
-                if response.status_code not in _RETRY_STATUSES:
-                    raise RuntimeError(
-                        f"Judge API error {response.status_code}: {response.text[:500]}"
-                    )
-                last_err = RuntimeError(
-                    f"Judge API error {response.status_code}: {response.text[:200]}"
-                )
-            except httpx.TransportError as e:
-                last_err = e
-            if attempt < _HTTP_RETRIES:
-                time.sleep(min(2**attempt, 8))
-        raise last_err if last_err else RuntimeError("judge request failed")
+        """Release the client's connection pool, if it has one to release."""
+        client = getattr(self, "client", None)
+        close = getattr(client, "close", None)
+        if close is not None:
+            close()
 
     @staticmethod
     def _parse_json(text: str) -> dict:
@@ -420,67 +404,115 @@ class Judge:
         raise ValueError(f"No JSON found in judge response: {text[:200]}")
 
 
+# Timeout, as (connect, read, write, pool) seconds. Kept as a plain tuple and
+# turned into a Timeout by each judge using *its own SDK's* re-export, rather
+# than one shared `httpx.Timeout`.
+#
+# As of anthropic 1.0.0 that SDK is built on `httpx2` -- a distinct
+# distribution, not an upgrade of `httpx`, and both are installed side by side.
+# An `httpx.Timeout` handed to an httpx2 client is not rejected; it reaches
+# `socket.settimeout` and dies there with `TypeError: 'Timeout' object cannot
+# be interpreted as an integer`, surfacing as a bare connection error that
+# reads like the endpoint is down. `anthropic.Timeout` / `openai.Timeout` are
+# correct on either version. (Google's SDK takes milliseconds and no class at
+# all, so it does not use this.)
+_TIMEOUT_S = dict(connect=30.0, read=600.0, write=120.0, pool=30.0)
+
+
 class AnthropicJudge(Judge):
-    """Anthropic Messages API, via ModelProxy's /anthropic route."""
+    """Anthropic Messages API."""
 
     provider = "anthropic"
-    endpoint = "/v1/messages"
 
-    def _extra_headers(self) -> dict:
-        return {"anthropic-version": ANTHROPIC_VERSION}
+    def __init__(self, model: str):
+        super().__init__(model)
+        import anthropic
 
-    def _payload(self, prompt: str, *, structured: bool) -> dict:
-        payload = {
-            "model": self.model,
-            "max_tokens": MAX_TOKENS,
-            "temperature": TEMPERATURE,
-            "messages": [{"role": "user", "content": prompt}],
-        }
+        api_key = _env("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                f"No credential for Anthropic judge {model!r}: set "
+                f"ANTHROPIC_API_KEY (on Kaggle, MODEL_PROXY_API_KEY, which the "
+                f"Harbor entrypoint translates into it)."
+            )
+        self.client = anthropic.Anthropic(
+            api_key=api_key,
+            # None leaves the SDK on its own default, api.anthropic.com.
+            base_url=_env("ANTHROPIC_BASE_URL"),
+            max_retries=_HTTP_RETRIES,
+            timeout=anthropic.Timeout(**_TIMEOUT_S),
+        )
+
+    def _call(self, prompt: str, *, structured: bool):
+        kwargs = dict(
+            model=self.model,
+            max_tokens=MAX_TOKENS,
+            messages=[{"role": "user", "content": prompt}],
+            # `temperature` rides in extra_body because the SDK dropped it as
+            # a named parameter in 1.0.0; on the wire it is unchanged. Same
+            # workaround as the agent's Anthropic adapter.
+            extra_body={"temperature": TEMPERATURE},
+        )
         if structured:
-            payload["output_config"] = {
+            kwargs["extra_body"]["output_config"] = {
                 "format": {"type": "json_schema", "schema": _VERDICT_SCHEMA}
             }
-        return payload
+        return self.client.messages.create(**kwargs)
 
-    def _extract_text(self, response: dict) -> str:
-        if response.get("stop_reason") == "max_tokens":
-            usage = response.get("usage", {}) or {}
+    def _extract_text(self, response) -> str:
+        if response.stop_reason == "max_tokens":
             raise ValueError(
                 f"Judge response truncated (stop_reason=max_tokens, "
-                f"input_tokens={usage.get('input_tokens', 'unknown')}, "
+                f"input_tokens={response.usage.input_tokens}, "
                 f"max_tokens={MAX_TOKENS}). The agent output is likely too "
                 f"large for the judge context window. Ensure criteria have "
                 f"deliverables lists to scope output."
             )
         return "".join(
-            block.get("text", "")
-            for block in response.get("content", [])
-            if block.get("type") == "text"
+            block.text for block in response.content if block.type == "text"
         )
 
 
 class OpenAIJudge(Judge):
-    """OpenAI Responses API, via ModelProxy's /openapi route.
+    """OpenAI Responses API.
 
     Two differences from the Anthropic path, both forced by the provider:
     ``temperature`` is omitted (ModelProxy answers 400 "Unsupported parameter"
-    for gpt-5.x), and truncation surfaces as a top-level ``status`` of
-    "incomplete" rather than a stop reason. Note that ``max_output_tokens``
-    bounds reasoning *and* output together here, unlike Anthropic's
-    ``max_tokens``.
+    for gpt-5.x -- upstream sends it and 400s), and truncation surfaces as a
+    top-level ``status`` of "incomplete" rather than a stop reason. Note that
+    ``max_output_tokens`` bounds reasoning *and* output together here, unlike
+    Anthropic's ``max_tokens``.
     """
 
     provider = "openai"
-    endpoint = "/responses"
 
-    def _payload(self, prompt: str, *, structured: bool) -> dict:
-        payload = {
-            "model": self.model,
-            "input": prompt,
-            "max_output_tokens": MAX_TOKENS,
-        }
+    def __init__(self, model: str):
+        super().__init__(model)
+        import openai
+
+        api_key = _env("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                f"No credential for OpenAI judge {model!r}: set OPENAI_API_KEY "
+                f"(on Kaggle, MODEL_PROXY_API_KEY, which the Harbor entrypoint "
+                f"translates into it)."
+            )
+        self.client = openai.OpenAI(
+            api_key=api_key,
+            # None leaves the SDK on its own default, api.openai.com.
+            base_url=_env("OPENAI_BASE_URL"),
+            max_retries=_HTTP_RETRIES,
+            timeout=openai.Timeout(**_TIMEOUT_S),
+        )
+
+    def _call(self, prompt: str, *, structured: bool):
+        kwargs = dict(
+            model=self.model,
+            input=prompt,
+            max_output_tokens=MAX_TOKENS,
+        )
         if structured:
-            payload["text"] = {
+            kwargs["text"] = {
                 "format": {
                     "type": "json_schema",
                     "name": "verdict",
@@ -488,67 +520,175 @@ class OpenAIJudge(Judge):
                     "schema": _VERDICT_SCHEMA,
                 }
             }
-        return payload
+        return self.client.responses.create(**kwargs)
 
-    def _extract_text(self, response: dict) -> str:
-        status = response.get("status")
-        if status == "incomplete":
-            details = response.get("incomplete_details") or {}
-            usage = response.get("usage", {}) or {}
+    def _extract_text(self, response) -> str:
+        if response.status == "incomplete":
+            reason = getattr(response.incomplete_details, "reason", None)
+            usage = response.usage
             raise ValueError(
                 f"Judge response truncated (status=incomplete, "
-                f"reason={details.get('reason', 'unknown')}, "
-                f"input_tokens={usage.get('input_tokens', 'unknown')}, "
+                f"reason={reason or 'unknown'}, "
+                f"input_tokens={usage.input_tokens if usage else 'unknown'}, "
                 f"max_output_tokens={MAX_TOKENS}). The agent output is likely "
                 f"too large for the judge context window, or reasoning "
                 f"consumed the output budget."
             )
-        if response.get("error"):
-            raise RuntimeError(f"Judge API error: {response['error']}")
-        # The raw JSON has no `output_text` convenience field -- that is an SDK
-        # accessor -- so walk the output items. Reasoning items are skipped.
-        return "".join(
-            part.get("text", "")
-            for item in response.get("output", [])
-            if item.get("type") == "message"
-            for part in item.get("content", [])
-            if part.get("type") == "output_text"
+        if response.error:
+            raise RuntimeError(f"Judge API error: {response.error}")
+        # `output_text` concatenates the output_text parts and skips reasoning
+        # items -- the same walk the httpx version had to do by hand.
+        return response.output_text
+
+
+class GoogleJudge(Judge):
+    """Google Gemini API.
+
+    New here; upstream has no Gemini judge. Structured output is native --
+    ``response_schema`` plus a JSON mime type -- rather than the per-provider
+    schema wrappers the other two use.
+    """
+
+    provider = "google"
+
+    def __init__(self, model: str):
+        super().__init__(model)
+        from google import genai
+        from google.genai import types
+
+        self._types = types
+        # The Harbor entrypoint exports GOOGLE_GENERATIVE_AI_API_KEY and
+        # GOOGLE_BASE_URL; the SDK itself reads GOOGLE_API_KEY / GEMINI_API_KEY
+        # and GOOGLE_GEMINI_BASE_URL. Neither set is a superset of the other,
+        # so both spellings are accepted here and the value is passed in
+        # explicitly rather than left to the SDK's own lookup.
+        api_key = _env(
+            "GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"
+        )
+        if not api_key:
+            raise RuntimeError(
+                f"No credential for Google judge {model!r}: set GOOGLE_API_KEY, "
+                f"GEMINI_API_KEY or GOOGLE_GENERATIVE_AI_API_KEY (on Kaggle, "
+                f"MODEL_PROXY_API_KEY, which the Harbor entrypoint translates "
+                f"into the last of those)."
+            )
+        self.client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                # None leaves the SDK on its own default.
+                base_url=_env("GOOGLE_GEMINI_BASE_URL", "GOOGLE_BASE_URL"),
+                timeout=600_000,  # Milliseconds here, unlike the other SDKs.
+                retry_options=types.HttpRetryOptions(
+                    attempts=_HTTP_RETRIES + 1  # Counts the initial call.
+                ),
+            ),
         )
 
+    def _call(self, prompt: str, *, structured: bool):
+        types = self._types
+        config = types.GenerateContentConfig(
+            temperature=TEMPERATURE,
+            max_output_tokens=MAX_TOKENS,
+            # AFC off. The judge declares no tools at all, but the SDK's
+            # automatic-function-calling branch logs "Direct use of automatic
+            # function calling (AFC) in Models.generate_content is not
+            # recommended" before it ever looks for a function map, so the
+            # warning lands in the verifier's stdout -- the same stdout that
+            # carries the per-criterion pass/fail report to a human. No
+            # converter serializes this field, so the request body does not
+            # change.
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                disable=True
+            ),
+        )
+        if structured:
+            config.response_mime_type = "application/json"
+            # A deep copy, because on google-genai 1.70 the SDK's schema
+            # transformer edits the dict it is handed in place, appending a
+            # `property_ordering` key. _VERDICT_SCHEMA is shared with the other
+            # two judges, and Anthropic rejects that key outright
+            # ("property_ordering is not supported"), so without the copy a
+            # dual run with a Google judge poisons its partner -- and only
+            # once Gemini has made the first call, which makes it look like a
+            # flake. 2.19 no longer mutates, but the version floats (the pin is
+            # a floor) and a caller-owned dict is not the SDK's to edit.
+            config.response_schema = copy.deepcopy(_VERDICT_SCHEMA)
+        return self.client.models.generate_content(
+            model=self.model, contents=prompt, config=config
+        )
 
-_JUDGE_CLASSES = {"anthropic": AnthropicJudge, "openai": OpenAIJudge}
+    def _extract_text(self, response) -> str:
+        # Upstream has no equivalent check because it has no Gemini judge. It
+        # is worth having: without it a truncated response arrives as partial
+        # JSON, fails to parse, and burns the retry ladder reporting a syntax
+        # error instead of the real cause.
+        candidate = (response.candidates or [None])[0]
+        finish = getattr(getattr(candidate, "finish_reason", None), "name", None)
+        if finish == "MAX_TOKENS":
+            usage = response.usage_metadata
+            raise ValueError(
+                f"Judge response truncated (finish_reason=MAX_TOKENS, "
+                f"input_tokens={usage.prompt_token_count if usage else 'unknown'}, "
+                f"max_output_tokens={MAX_TOKENS}). The agent output is likely "
+                f"too large for the judge context window, or thinking consumed "
+                f"the output budget."
+            )
+        return response.text or ""
+
+
+_JUDGE_CLASSES = {
+    "anthropic": AnthropicJudge,
+    "openai": OpenAIJudge,
+    "google": GoogleJudge,
+}
+
+# Recognized provider prefixes -> the key in _JUDGE_CLASSES. `gemini/` is
+# harbor's own alias for google (see PROVIDERS in harbor's model_connection).
+_JUDGE_PREFIXES = {
+    "anthropic": "anthropic",
+    "openai": "openai",
+    "google": "google",
+    "gemini": "google",
+}
 
 
 def judge_provider(spec: str) -> str:
     """Infer a judge model's provider, the way the agent's adapters do.
 
-    Unlike ``adapters.split_model_name`` this does not strip the prefix: the
-    spec is sent to ModelProxy verbatim, so a bare ``claude-sonnet-4-6`` stays
-    bare and the default request is byte-identical to the single-judge one.
+    Unlike ``adapters.split_model_name`` this recognizes a prefix without
+    stripping it: the spec is sent as the model id verbatim, because that is
+    the spelling ModelProxy wants, and because it keeps a bare
+    ``claude-sonnet-4-6`` byte-identical to the default single-judge request.
+    See README deviation #10.
+
+    Upstream's ``_detect_provider`` is deliberately not vendored: it is
+    prefix-less and rejects ``anthropic/claude-sonnet-4-6`` outright.
     """
     head, _, rest = spec.partition("/")
-    if rest and head in _PROXY_PATHS:
-        return head
+    if rest and head in _JUDGE_PREFIXES:
+        return _JUDGE_PREFIXES[head]
     name = (rest or head).lower()
     if name.startswith("claude"):
         return "anthropic"
-    if name.startswith(("gpt", "o1", "o3", "o4")):
+    if name.startswith(("gpt", "o1", "o3", "o4", "o5")):
         return "openai"
-    options = ", ".join(f"{p}/{spec}" for p in sorted(_PROXY_PATHS))
+    if name.startswith("gemini"):
+        return "google"
+    options = ", ".join(f"{p}/{spec}" for p in sorted(_JUDGE_CLASSES))
     raise ValueError(
         f"Cannot infer a provider for judge model {spec!r}. Prefix it "
         f"explicitly, e.g. {options}."
     )
 
 
-def create_judge(spec: str, proxy_base: str, api_key: str) -> Judge:
-    """Build the judge for a model spec, routed to its ModelProxy path."""
-    provider = judge_provider(spec)
-    return _JUDGE_CLASSES[provider](
-        model=spec,
-        base_url=f"{proxy_base.rstrip('/')}/{_PROXY_PATHS[provider]}",
-        api_key=api_key,
-    )
+def create_judge(spec: str) -> Judge:
+    """Build the judge for a model spec.
+
+    Raises ``RuntimeError`` if that provider has no credential in the
+    environment. Checking here rather than up front is what lets an
+    Anthropic-only run proceed with no Google key present.
+    """
+    return _JUDGE_CLASSES[judge_provider(spec)](model=spec)
 
 
 # -- Deliverable matching -------------------------------------------------
@@ -920,18 +1060,6 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    api_key = os.environ.get("MODEL_PROXY_API_KEY")
-    if not api_key:
-        print("error: MODEL_PROXY_API_KEY is not set", file=sys.stderr)
-        return 2
-
-    proxy_base = os.environ.get(
-        "MODEL_PROXY_BASE_URL", "https://mp-staging.kaggle.net/models"
-    ).rstrip("/")
-    # The Kaggle runner supplies the proxy root without the /models segment.
-    if not proxy_base.endswith("/models"):
-        proxy_base = f"{proxy_base}/models"
-
     config = json.loads(args.task_json.read_text(encoding="utf-8"))
     criteria = config["criteria"]
     # Title only. Passing the instructions here would leak the task's own
@@ -941,8 +1069,11 @@ def main() -> int:
 
     specs = resolve_judge_models(args.models, args.model)
     try:
-        judges = [create_judge(spec, proxy_base, api_key) for spec in specs]
-    except ValueError as e:
+        # ValueError: unrecognizable model spec. RuntimeError: recognized, but
+        # that provider has no credential. Both are configuration, hence 2 --
+        # distinct from the 3 that means a configured judge did not answer.
+        judges = [create_judge(spec) for spec in specs]
+    except (ValueError, RuntimeError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
@@ -1003,8 +1134,8 @@ def _preflight(judges: list[Judge]) -> bool:
     failed = [(j, err) for j, err in outcomes if err is not None]
     for judge, err in failed:
         print(
-            f"!! JUDGE UNREACHABLE: {judge.model} (provider={judge.provider}, "
-            f"endpoint={judge.endpoint}): {err}",
+            f"!! JUDGE UNREACHABLE: {judge.model} "
+            f"(provider={judge.provider}): {err}",
             file=sys.stderr,
         )
     if failed:

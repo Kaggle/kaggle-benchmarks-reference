@@ -22,13 +22,13 @@ judge_profile = "single"  # dual is opt-in; see [verifier.env] below
 # Upstream runs the agent sandbox with `docker --network=none`: the benchmark
 # is closed-universe, and a task solved by searching the web is not the task.
 # That still holds here, because the agent process itself runs on the host and
-# reaches ModelProxy from there -- only the container it drives is cut off.
+# calls the model API from there -- only the container it drives is cut off.
 [agent]
 timeout_sec = 3600.0
 network_mode = "no-network"
 
 # The verifier is the exception: its LLM-as-judge runs inside the container and
-# needs egress to ModelProxy. Harbor's Linux Docker environment can switch
+# needs egress to a model API. Harbor's Linux Docker environment can switch
 # policy between phases, so the agent phase stays sealed.
 #
 # timeout_sec scales with the rubric: the judge issues one call per criterion,
@@ -37,7 +37,20 @@ network_mode = "no-network"
 [verifier]
 timeout_sec = @@VERIFIER_TIMEOUT@@
 network_mode = "allowlist"
-allowed_hosts = ["mp-staging.kaggle.net", "mp.kaggle.net"]
+# The judge speaks the vendor APIs, so the allowlist names the vendor
+# endpoints -- and, because on Kaggle those requests are pointed at ModelProxy
+# by the base-URL variables the entrypoint exports, the proxy hosts too. A
+# superset: whichever of the two a given environment actually dials, the other
+# entries are simply never used. The list stays a tight backstop -- notably
+# against a judge reaching a package index -- rather than an open door.
+allowed_hosts = [
+  "api.anthropic.com",
+  "api.openai.com",
+  "generativelanguage.googleapis.com",
+  # Kaggle-specific infrastructure allowance. If run on another platform, this is not required.
+  "mp-staging.kaggle.net",
+  "mp.kaggle.net",
+]
 
 [environment]
 build_timeout_sec = 1800.0
@@ -48,17 +61,36 @@ gpus = 0
 mcp_servers = []
 network_mode = "no-network"
 
-# The verifier calls ModelProxy to run the LLM-as-judge rubric. Credentials are
-# templated from the host environment; the base URL defaults to staging.
-# Harbor forwards only the variables declared here.
+# The verifier runs the LLM-as-judge rubric against a model API. Harbor
+# forwards only the variables declared here, so every name any of the three
+# SDKs might read has to be listed -- this block is a pure passthrough and
+# judge.py::_env owns the precedence between the spellings.
+#
+# Nothing here constructs a URL. On Kaggle the image entrypoint exports these
+# same names already pointed at ModelProxy, so they arrive filled in; off
+# Kaggle they carry whatever the host set, and an empty one leaves the SDK on
+# its own vendor default.
+#
+# Every entry needs a `:-` default. harbor's resolve_env_vars matches with
+# fullmatch and *raises* on a bare `${VAR}` that is unset, which would abort
+# the trial before the container starts. With the default an unset variable
+# arrives as "" and judge.py exits 2 naming the provider it lacked -- and
+# test.sh's trap still writes the zero reward.
 #
 # One Anthropic judge by default. Setting LAB_JUDGE_MODELS to a comma-separated
 # list turns on upstream's dual grading, where each judge collapses to its own
 # all-pass verdict and the reward is their mean:
 #   LAB_JUDGE_MODELS="claude-sonnet-4-6,gpt-5.5"
 [verifier.env]
-MODEL_PROXY_API_KEY = "${MODEL_PROXY_API_KEY}"
-MODEL_PROXY_BASE_URL = "${MODEL_PROXY_BASE_URL:-https://mp-staging.kaggle.net/models}"
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+ANTHROPIC_BASE_URL = "${ANTHROPIC_BASE_URL:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+OPENAI_BASE_URL = "${OPENAI_BASE_URL:-}"
+GOOGLE_API_KEY = "${GOOGLE_API_KEY:-}"
+GEMINI_API_KEY = "${GEMINI_API_KEY:-}"
+GOOGLE_GENERATIVE_AI_API_KEY = "${GOOGLE_GENERATIVE_AI_API_KEY:-}"
+GOOGLE_GEMINI_BASE_URL = "${GOOGLE_GEMINI_BASE_URL:-}"
+GOOGLE_BASE_URL = "${GOOGLE_BASE_URL:-}"
 JUDGE_MODEL = "${LAB_JUDGE_MODEL:-claude-sonnet-4-6}"
 JUDGE_MODELS = "${LAB_JUDGE_MODELS:-}"
 JUDGE_PARALLEL = "${LAB_JUDGE_PARALLEL:-8}"

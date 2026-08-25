@@ -18,9 +18,15 @@ Ported from harvey-labs harness/adapters/base.py (MIT, (c) 2026 Harvey AI).
 
 Each adapter translates between the harness's canonical format and a
 provider's native API. The agent loop only talks to this interface, which is
-the seam OpenAI and Google support landed on: each adapter routes to a
-different ModelProxy path (/anthropic, /openapi, /genai) without touching the
-loop.
+the seam OpenAI and Google support landed on: each adapter wraps a different
+vendor SDK without touching the loop.
+
+Adapters are stateless with respect to conversation history. `loop.py` passes
+the entire message list on every call and separately appends whatever
+`make_tool_result_messages` returns, so an adapter that also accumulated its
+own copy would double-count the history. Upstream's OpenAI and Google adapters
+do exactly that, because upstream's driver hands them only the newest turn;
+see README deviation #14.
 """
 
 from abc import ABC, abstractmethod

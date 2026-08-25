@@ -3,9 +3,12 @@
 # Run with:
 #   harbor run -c config.yaml
 #
-# Requires MODEL_PROXY_API_KEY and MODEL_PROXY_BASE_URL in the environment
-# (see .env). Both the agent and the verifier reach models only through
-# Kaggle's ModelProxy.
+# Requires a model credential in the environment for whichever provider the
+# agent and the judge are pointed at -- ANTHROPIC_API_KEY, OPENAI_API_KEY, or
+# one of the GOOGLE_/GEMINI_ names, plus the matching *_BASE_URL if the target
+# is not the vendor's own endpoint. On Kaggle the image entrypoint derives all
+# of them from MODEL_PROXY_API_KEY / MODEL_PROXY_BASE_URL. See the Environment
+# variables section of README.md.
 
 job_name: lab
 jobs_dir: jobs
@@ -36,7 +39,9 @@ agents:
   #   google/gemini-3.5-flash-lite
   #   google/gemini-3.6-flash
   #   google/gemini-3.1-pro-preview
-  #   xai/grok-4.5
+  #   xai/grok-4.5   (resolves through the OpenAI connection -- there is no
+  #                   xAI route on the proxy, and Grok is served on the
+  #                   OpenAI-compatible surface with Kaggle's ModelProxy)
   # The default is held on a cheaper Anthropic model for stable comparisons.
   # See the Agent section of README.md.
   - import_path: agents.lab_harness:LABHarnessAgent

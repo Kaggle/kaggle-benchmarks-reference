@@ -47,7 +47,8 @@ ls -la "$OUTPUT_DIR" || true
 
 # Every dependency in judge.py's inline block is baked into the image, so the
 # judge runs against the system interpreter. Nothing is installed at verify
-# time, which is what keeps the verifier's allowlist down to ModelProxy.
+# time, which is what keeps the verifier's allowlist down to the model
+# endpoints -- no package index has to be reachable from in here.
 python3 "$TESTS_DIR/judge.py" \
   --task-json "$TESTS_DIR/task.json" \
   --prompt "$TESTS_DIR/rubric_criterion.txt" \

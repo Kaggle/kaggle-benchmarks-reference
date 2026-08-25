@@ -12,41 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Adapter for Kaggle ModelProxy's /openapi path.
+"""OpenAI Responses-API adapter.
 
-Named for the route, not for a vendor: /openapi is ModelProxy's
-Responses-API surface, and it serves more than one provider. OpenAI's gpt-5.x
-and o-series ride it, and so does xAI's Grok -- there is no /xai route on the
-proxy (``/models/xai/...`` answers 404), so ``xai/grok-4.5`` is dispatched
-here with its prefix stripped. See the registry in ``__init__.py``.
+Ported from harvey-labs harness/adapters/openai.py (MIT, (c) 2026 Harvey AI).
 
-Preserves the harness's contract: the same six tools with the same schemas,
-the same system prompt, and a loop that ends when the model stops calling
-tools. Only the wire format differs.
+Uses the ``openai`` SDK against whatever base URL the environment supplies.
+Nothing here knows about Kaggle's ModelProxy: on Kaggle the Harbor entrypoint
+exports ``OPENAI_API_KEY`` / ``OPENAI_BASE_URL`` pointing at the proxy, and off
+Kaggle the SDK's own defaults reach api.openai.com. The caller resolves both
+and passes them in.
 
-The Responses API is used rather than Chat Completions: it is the current
-surface for the gpt-5 family, Grok is compatible with it, and
-``tests/judge.py`` is consistent.
+Kaggle-specific infrastructure change (b/552103826):
+Serves more than one vendor. OpenAI's gpt-5.x and o-series ride the Responses
+API, and so does xAI's Grok, which is OpenAI-compatible via ModelProxy;
+``__init__.py`` maps both providers here. (``xai-sdk`` was evaluated for Grok and
+rejected: it is gRPC-only and its ``api_host`` is a bare hostname that cannot carry
+a path, so it cannot be pointed at a proxied base URL.)
+
+Preserves the harness's contract: the same six tools with the same schemas, the
+same system prompt, and a loop that ends when the model stops calling tools.
 
 Like the Anthropic adapter, this one replays the model's reasoning across
 turns, so the model continues its previous chain of thought rather than
 re-deriving one. ``store`` is left off the payload entirely; see ``_flatten``.
 Verified on Grok as well: replaying its ``reasoning`` items verbatim across a
 tool-calling turn is accepted.
-
-Like the Anthropic adapter, the transport is ``httpx`` rather than the
-``openai`` SDK: this agent runs in Harbor's executor process and cannot add
-dependencies to it.
 """
 
-import json
-import time
-
-import httpx
+import openai
 
 from .base import ModelAdapter, ModelResponse, ToolCall
 
-# Models that reject `temperature` outright. ModelProxy answers
+# Models that reject `temperature` outright. The API answers
 # 400 "Unsupported parameter: 'temperature' is not supported with this model"
 # for the gpt-5 family. The judge hit the same wall on its own OpenAI path
 # (see README deviation #9): the consequence is that these models are not
@@ -59,34 +56,15 @@ from .base import ModelAdapter, ModelResponse, ToolCall
 # config.yaml path for gpt-5.x and exactly the 400 that README deviation #14
 # exists to prevent.
 #
-# Grok is deliberately absent: `grok-4.5` was tested against mp-staging with
-# `temperature: 0.0` and answered 200, so it falls through this tuple and does
-# get temperature-pinned. Don't add it "for symmetry" -- that would silently
-# give up determinism on the xAI route for no reason.
+# Grok is deliberately absent: `grok-4.5` was tested with `temperature: 0.0`
+# and answered 200, so it falls through this tuple and does get
+# temperature-pinned. Don't add it "for symmetry" -- that would silently give
+# up determinism on the xAI route for no reason.
 NO_TEMPERATURE_MODELS = ("gpt-5", "o1", "o3", "o4")
 
-# Statuses worth another attempt: rate limits, overload, and transient 5xx.
-# Same set as the Anthropic adapter and the judge.
-_RETRY_STATUSES = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
 
-
-class OpenAPIError(RuntimeError):
-    """A non-retryable error returned by the Responses API.
-
-    The message embeds the API's own error text. The agent loop inspects it
-    for "context_length_exceeded" to distinguish a context overflow (a
-    legitimate run outcome) from a real failure, so the wording must be
-    preserved.
-    """
-
-    def __init__(self, status_code: int, body: str):
-        self.status_code = status_code
-        self.body = body
-        super().__init__(f"OpenAPI route error {status_code}: {body}")
-
-
-class OpenAPIAdapter(ModelAdapter):
-    """Adapter for models served on ModelProxy's /openapi route.
+class OpenAIAdapter(ModelAdapter):
+    """Adapter for models served on the Responses API.
 
     Currently OpenAI's gpt-5.x / o-series and xAI's Grok.
     """
@@ -94,7 +72,7 @@ class OpenAPIAdapter(ModelAdapter):
     # Max output tokens per model family. Unlike Anthropic's `max_tokens`,
     # `max_output_tokens` bounds reasoning *and* visible output together, so a
     # value that looks generous can still be consumed entirely by reasoning.
-    # judge.py:466 makes the same point about its own OpenAI path.
+    # judge.py makes the same point about its own OpenAI path.
     #
     # The model's full output ceiling, matching how the Anthropic table is
     # built: give each model everything it has and let the loop decide. The
@@ -102,8 +80,9 @@ class OpenAPIAdapter(ModelAdapter):
     # id with no entry here -- o1/o3/o4 all route to this adapter -- gets the
     # same budget upstream would have given it.
     #
-    # Note that ModelProxy prices a cost reservation off this number before it
-    # runs anything, so a depleted quota surfaces as
+    # Note that Kaggle's ModelProxy, when it is what the base URL resolves to,
+    # prices a cost reservation off this number before it runs anything, so a
+    # depleted quota surfaces as
     # 403 "max estimated cost of operation ($N) exceeds your available quota"
     # rather than as anything wrong with the request. That is an environment
     # condition to wait out, not a reason to shrink the cap.
@@ -118,8 +97,8 @@ class OpenAPIAdapter(ModelAdapter):
     def __init__(
         self,
         model: str,
-        base_url: str,
-        api_key: str,
+        api_key: str | None = None,
+        base_url: str | None = None,
         temperature: float = 0.0,
         max_tokens: int | None = None,
         reasoning_effort: str | None = None,
@@ -132,18 +111,22 @@ class OpenAPIAdapter(ModelAdapter):
                 128000,
             )
         self.max_tokens = max_tokens
-        self.base_url = base_url.rstrip("/")
-        self.max_retries = max_retries
-        self.client = httpx.Client(
-            base_url=self.base_url,
-            headers={
-                # ModelProxy authenticates with a bearer token.
-                "Authorization": f"Bearer {api_key}",
-                "content-type": "application/json",
-            },
+        self.client = openai.OpenAI(
+            # None lets the SDK fall back to its own env lookup / default.
+            api_key=api_key,
+            base_url=base_url,
+            max_retries=max_retries,
             # Generous read timeout: a reasoning model can think for a long
             # while before the first byte of a non-streamed response.
-            timeout=httpx.Timeout(connect=30.0, read=900.0, write=120.0, pool=30.0),
+            #
+            # `openai.Timeout`, not `httpx.Timeout`: the two are the same
+            # class today, but the Anthropic SDK has already moved to the
+            # separate `httpx2` distribution and an SDK-owned re-export is
+            # what survives that. See the same note in
+            # anthropic_adapter.py for what the mismatch looks like.
+            timeout=openai.Timeout(
+                connect=30.0, read=900.0, write=120.0, pool=30.0
+            ),
         )
         self._instructions: str | None = None
 
@@ -157,92 +140,77 @@ class OpenAPIAdapter(ModelAdapter):
             else:
                 input_items.extend(self._flatten(msg))
 
-        payload = {
-            "model": self.model,
-            "input": input_items,
-            "instructions": self._instructions or "",
-            "tools": [self._translate_tool(t) for t in tools],
-            "max_output_tokens": self.max_tokens,
-        }
+        kwargs = dict(
+            model=self.model,
+            input=input_items,
+            instructions=self._instructions or "",
+            tools=[self._translate_tool(t) for t in tools],
+            max_output_tokens=self.max_tokens,
+        )
 
         if not self.model.startswith(NO_TEMPERATURE_MODELS):
-            payload["temperature"] = self.temperature
+            kwargs["temperature"] = self.temperature
 
         if self.reasoning_effort:
-            payload["reasoning"] = {
+            kwargs["reasoning"] = {
                 "effort": self.reasoning_effort,
                 "summary": "auto",
             }
 
-        response = self._post(payload)
+        response = self.client.responses.create(**kwargs)
 
-        status = response.get("status")
-        if status == "incomplete":
-            details = response.get("incomplete_details") or {}
-            raise OpenAPIError(
-                200,
-                f"response incomplete (reason={details.get('reason', 'unknown')}, "
-                f"max_output_tokens={self.max_tokens})",
+        if response.status == "incomplete":
+            details = response.incomplete_details
+            reason = getattr(details, "reason", None) or "unknown"
+            raise RuntimeError(
+                f"Responses API returned an incomplete response "
+                f"(reason={reason}, max_output_tokens={self.max_tokens})"
             )
-        if response.get("error"):
-            raise OpenAPIError(200, json.dumps(response["error"]))
+        if response.error:
+            raise RuntimeError(f"Responses API error: {response.error}")
 
-        output = response.get("output", []) or []
+        output = list(response.output or [])
 
         tool_calls = []
         text_parts = []
         for item in output:
-            itype = item.get("type")
-            if itype == "function_call":
+            if item.type == "function_call":
                 tool_calls.append(
                     ToolCall(
                         # The Responses API distinguishes the item id (`id`)
                         # from the call id (`call_id`); it is `call_id` that a
                         # function_call_output has to reference.
-                        id=item.get("call_id", ""),
-                        name=item.get("name", ""),
-                        arguments=item.get("arguments", "{}"),
+                        id=item.call_id,
+                        name=item.name,
+                        arguments=item.arguments,
                     )
                 )
-            elif itype == "message":
-                for part in item.get("content", []) or []:
-                    if part.get("type") == "output_text":
-                        text_parts.append(part.get("text", ""))
+            elif item.type == "message":
+                for part in item.content or []:
+                    if getattr(part, "type", None) == "output_text":
+                        text_parts.append(part.text)
 
-        usage = response.get("usage", {}) or {}
+        usage = response.usage
 
         return ModelResponse(
             # The whole output array is carried into history as one opaque
             # message so the loop stays provider-agnostic; `_flatten` unpacks
             # it on the way back out and decides what is replayable.
-            message={"role": "assistant", "_output": output},
+            #
+            # `exclude_unset` rather than a hand-built projection: the items go
+            # straight back on the wire next turn, so anything the API set --
+            # `encrypted_content` on reasoning items above all -- has to
+            # survive the round trip, while anything it left unset must stay
+            # absent rather than be sent back as an explicit null.
+            message={
+                "role": "assistant",
+                "_output": [item.model_dump(exclude_unset=True) for item in output],
+            },
             tool_calls=tool_calls,
             text="\n".join(text_parts),
-            input_tokens=usage.get("input_tokens", 0),
-            output_tokens=usage.get("output_tokens", 0),
+            input_tokens=usage.input_tokens if usage else 0,
+            output_tokens=usage.output_tokens if usage else 0,
         )
-
-    # -- Transport --------------------------------------------------------
-
-    def _post(self, payload: dict) -> dict:
-        """POST /responses with the same retry ladder as the other adapters."""
-        last_error: Exception | None = None
-
-        for attempt in range(self.max_retries + 1):
-            try:
-                response = self.client.post("/responses", json=payload)
-                if response.status_code == 200:
-                    return response.json()
-                if response.status_code not in _RETRY_STATUSES:
-                    raise OpenAPIError(response.status_code, response.text)
-                last_error = OpenAPIError(response.status_code, response.text)
-            except (httpx.TransportError, httpx.StreamError) as e:
-                last_error = e
-
-            if attempt < self.max_retries:
-                time.sleep(min(2**attempt, 8))
-
-        raise last_error if last_error else RuntimeError("request failed")
 
     # -- Message construction ---------------------------------------------
 
@@ -255,9 +223,15 @@ class OpenAPIAdapter(ModelAdapter):
         same way; here they are unpacked back into the individual items the
         Responses API wants.
 
+        This adapter is deliberately stateless, where upstream's accumulates
+        `self._context` across turns. `loop.py` passes the entire message list
+        on every call and also appends whatever `make_tool_result_messages`
+        returns, so an adapter that kept its own copy would double-count the
+        history. See README deviation #14.
+
         Reasoning items are replayed along with everything else, which is what
         upstream does and what keeps gpt-5.x continuing its previous chain of
-        thought rather than re-deriving one each turn. The Anthropic and Google
+        thought rather than re-deriving one. The Anthropic and Google
         adapters echo their own reasoning state back the same way.
 
         This route was previously recorded as rejecting reasoning replay two

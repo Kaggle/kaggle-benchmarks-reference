@@ -251,16 +251,70 @@ different upstream commits will silently mis-grade rather than fail.
 
 ## Environment variables
 
-Create a `.env` file (gitignored) with the following contents:
+**Nothing in this repository builds a model URL.** Both the agent and the judge
+call the vendor SDKs, and each SDK reads its own key and base URL from the
+environment. Which endpoint that turns out to be is the environment's decision,
+not the code's.
+
+**On Kaggle** — in production, and locally through `run-local-datasets.sh` with
+a `harbor-kaggle-*` image — you only need the proxy credential:
+
+```
 MODEL_PROXY_API_KEY=<Your ModelProxy API key>
 MODEL_PROXY_BASE_URL=<Target ModelProxy base URL, e.g. https://mp-staging.kaggle.net/models>
+```
 
-All model traffic — the agent's and the judge's — goes through
-Kaggle's ModelProxy; no vendor APIs are called directly.
+The image entrypoint (`harbor_translate_agent_creds`) fans those two out into
+every vendor variable below, each base URL pointed at the proxy's route for
+that provider. The SDKs then land on ModelProxy without anything here knowing
+it exists.
+
+**Off Kaggle**, set the pair for whichever provider you are using directly.
+Omit the base URL to reach the vendor's own endpoint:
+
+| Provider  | Key                                                                | Base URL                                     |
+| --------- | ------------------------------------------------------------------ | -------------------------------------------- |
+| Anthropic | `ANTHROPIC_API_KEY`                                                  | `ANTHROPIC_BASE_URL`                          |
+| OpenAI    | `OPENAI_API_KEY`                                                     | `OPENAI_BASE_URL`                             |
+| Google    | `GOOGLE_API_KEY` / `GEMINI_API_KEY` / `GOOGLE_GENERATIVE_AI_API_KEY` | `GOOGLE_GEMINI_BASE_URL` / `GOOGLE_BASE_URL`  |
+
+Two names apiece on the Google row because the Kaggle entrypoint exports
+`GOOGLE_GENERATIVE_AI_API_KEY` and `GOOGLE_BASE_URL` while the `google-genai`
+SDK reads `GOOGLE_API_KEY`/`GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL` —
+neither set is a superset of the other. Both spellings are accepted on both
+sides; see deviation #12.
+
+xAI has no row of its own: Grok is served on the OpenAI-compatible surface, so
+`xai/grok-4.5` uses the `OPENAI_*` pair. See [Agent](#agent).
+
+The agent resolves these through harbor's own `resolve_model_connection`, so
+`--ae ANTHROPIC_BASE_URL=…` overrides them per run. The judge resolves them in
+`judge.py::_env`; `task.toml`'s `[verifier.env]` forwards every name listed
+above into the verifier container.
 
 ## Running Locally
 Assumes that you have pulled / cloned Harbor framework (https://github.com/laude-institute/harbor)
 to `/home/kaggle/git/harbor`.
+
+A plain `harbor run` gets no entrypoint, so nothing translates
+`MODEL_PROXY_*` for you. Export the vendor pair yourself first — either at the
+real vendor, or at the proxy if that is what your key is for:
+
+```bash
+# Against ModelProxy, the way the Kaggle entrypoint would have done it.
+export ANTHROPIC_API_KEY="$MODEL_PROXY_API_KEY"
+export ANTHROPIC_BASE_URL="$MODEL_PROXY_BASE_URL/anthropic"
+export OPENAI_API_KEY="$MODEL_PROXY_API_KEY"
+export OPENAI_BASE_URL="$MODEL_PROXY_BASE_URL/openapi"
+export GOOGLE_GENERATIVE_AI_API_KEY="$MODEL_PROXY_API_KEY"
+export GOOGLE_BASE_URL="$MODEL_PROXY_BASE_URL/genai"
+
+# Or against the vendors: set only the key, and leave the base URL unset so
+# each SDK applies its own default.
+```
+
+The `run-local-datasets.sh` path further down needs none of this — its image
+entrypoint does the translation.
 
 ```bash
 # Whole job (all 2,010 tasks, Pass@1 metric). This is ~114,000 judge calls --
@@ -332,8 +386,11 @@ Verifier-side, via the host environment (templated in `task.toml`):
 
 `LAB_JUDGE_PARALLEL` is per judge, so dual mode issues up to `2 ×` the
 concurrent calls rather than taking twice as long. A model id may be prefixed
-with its provider (`openai/gpt-5.5`); a bare one is inferred the same way
-the agent's adapters do.
+with its provider (`openai/gpt-5.5`, `google/gemini-3.6-flash`, and `gemini/`
+as an alias for `google/`); a bare one is inferred the same way the agent's
+adapters do. Judges may be Anthropic, OpenAI, or Google — there is no xAI
+judge. Each judge's credential is checked when it is constructed, not up front,
+so an Anthropic-only run needs no Google key present.
 
 Raising `LAB_JUDGE_PARALLEL` without also raising `--timeout-multiplier` is
 safe, but lowering it is not: each task's `verifier.timeout_sec` is sized
@@ -357,37 +414,47 @@ Three model families are wired up for the _agent_, each behind the
 `ModelAdapter` interface in `adapters/`. The loop is provider-agnostic and does
 not change when one is added.
 
-| Provider    | Prefix       | ModelProxy path | API surface                    | Auth                | Verified against                                                          |
-| ----------- | ------------ | --------------- | ------------------------------ | ------------------- | ------------------------------------------------------------------------- |
-| Anthropic   | `anthropic/` | `/anthropic`    | Messages, streaming            | `Authorization`     | `claude-sonnet-4-6`                                                        |
-| OpenAI      | `openai/`    | `/openapi`      | Responses, non-streaming       | `Authorization`     | `gpt-5.6-sol`                                                              |
-| Google      | `google/`    | `/genai`        | `generateContent`, non-streaming | `x-goog-api-key`  | `gemini-3.5-flash-lite`, `gemini-3.6-flash`, `gemini-3.1-pro-preview`      |
-| xAI         | `xai/`       | `/openapi`      | Responses, non-streaming       | `Authorization`     | `grok-4.5`                                                                 |
+| Provider    | Prefix       | SDK            | Base-URL env                                 | API surface                      | Verified against                                                      |
+| ----------- | ------------ | -------------- | -------------------------------------------- | -------------------------------- | --------------------------------------------------------------------- |
+| Anthropic   | `anthropic/` | `anthropic`    | `ANTHROPIC_BASE_URL`                         | Messages, streaming              | `claude-sonnet-4-6`                                                    |
+| OpenAI      | `openai/`    | `openai`       | `OPENAI_BASE_URL`                            | Responses, non-streaming         | `gpt-5.6-sol`                                                          |
+| Google      | `google/`    | `google-genai` | `GOOGLE_GEMINI_BASE_URL` / `GOOGLE_BASE_URL` | `generateContent`, non-streaming | `gemini-3.5-flash-lite`, `gemini-3.6-flash`, `gemini-3.1-pro-preview`  |
+| xAI         | `xai/`       | `openai`       | `OPENAI_BASE_URL`                            | Responses, non-streaming         | `grok-4.5`                                                             |
 
-xAI shares OpenAI's `/openapi` path and its adapter. There is no xAI route on
-the proxy — `/models/xai/grok-4.5` answers 404 and every other `/models/xai/…`
-spelling answers 405 — while `/openapi` serves Grok on the Responses API. The
-adapter class is therefore named `OpenAPIAdapter`, after the route rather than
-a vendor. Grok accepts `temperature`, unlike the gpt-5 family, so it stays
+The SDKs are not Harbor dependencies and are not all present in its venv, so
+`setup()` installs the one this run needs if the import fails — only that one,
+only when it is missing. See deviation #4.
+
+xAI borrows the OpenAI connection: `_CONNECTION_PROVIDER` in `agent.py` maps
+`xai → openai` so it picks up `OPENAI_API_KEY`/`OPENAI_BASE_URL`, which is
+where Grok actually lives — ModelProxy has no xAI route (`/models/xai/…`
+answers 404/405) and harbor's own `PROVIDERS["xai"]` points at `api.x.ai` with
+an `XAI_API_KEY` the Kaggle entrypoint never populates. The `xai-sdk` was
+evaluated and rejected: it speaks gRPC only, its `api_host` takes a bare
+hostname with no path component, and the proxy answers its call with `405`.
+Grok accepts `temperature`, unlike the gpt-5 family, so it stays
 temperature-pinned; tool calls and verbatim reasoning replay both work
-unmodified.
+unmodified. `MODEL_CONNECTION` is deliberately left unset on the agent class so
+run metadata still reports a Grok run's provider as `xai` rather than `openai`.
 
-No adapter keeps a model allowlist: the prefix picks the route, and any model
-the proxy serves on that route works. Per-model tables tune `max_tokens` and
-reasoning, but an unrecognized id is still dispatched. An unprefixed name is
-inferred from the id (`claude*`, `gpt*`/`o1`/`o3`/`o4`, `gemini*`, `grok*`).
+No adapter keeps a model allowlist: the prefix picks the SDK, and any model the
+endpoint serves works. Per-model tables tune `max_tokens` and reasoning, but an
+unrecognized id is still dispatched. An unprefixed name is inferred from the id
+(`claude*`, `gpt*`/`o1`/`o3`/`o4`, `gemini*`, `grok*`).
 
 Every adapter echoes its provider's reasoning state back verbatim on the
 next turn — Anthropic's signed thinking blocks, Gemini's `thoughtSignature`
-parts, and the reasoning items returned by both OpenAI and Grok on the
-`/openapi` route. On the Google path, setting a reasoning effort
-also asks for the thought text itself (`includeThoughts`); those parts are
-replayed into history but filtered out of the response text, so they inform the
-next turn without reaching the deliverable.
+parts, and the reasoning items returned by both OpenAI and Grok. On the Google
+path, setting a reasoning effort also asks for the thought text itself
+(`include_thoughts`); those parts are replayed into history but filtered out of
+the response text, so they inform the next turn without reaching the
+deliverable.
 
-The _judge_ speaks both Anthropic and OpenAI, but through its own seam in
+The _judge_ speaks Anthropic, OpenAI, and Google, but through its own seam in
 `tests/judge.py`, which deliberately shares no code with these adapters: Harbor
 uploads `tests/` into the container by itself, so `judge.py` has to stand alone.
+That is also why the `GOOGLE_*` name bridge exists twice — the agent gets it
+from harbor's `PROVIDERS` table, the judge from its own `_env` helper.
 
 ## Intentional deviations from the original reference implementation ("upstream")
 
@@ -409,13 +476,19 @@ something different, and why:
    `environment/` directory, so `documents/` lives there and is copied in at
    build time (and `chmod a-w`) rather than bind-mounted read-only.
 
-4. **The model adapters use `httpx`, not the vendor SDKs.** An external agent
-   runs inside Harbor's own interpreter and cannot add dependencies to it;
-   `httpx` is one of Harbor's core dependencies, the `anthropic` SDK is not.
-   The request bodies, streaming mode, per-model `max_tokens`, temperature
-   rules, and verbatim thinking-block echo are all preserved. The OpenAI and
-   Google adapters follow the same rule for the same reason, so neither uses
-   `openai` or `google-genai` either.
+4. **The agent's SDKs are installed at run time.** Like upstream, the adapters
+   use the vendor SDKs. Unlike upstream, an external agent runs inside Harbor's
+   own interpreter, and that venv ships `openai` but not `anthropic` or
+   `google-genai` — this repo has no say in that image. So `setup()` imports
+   the selected provider's package and, only if the import fails, installs it
+   with `uv pip install` before the run begins; the agent phase still has
+   network, it is only the task container that is sealed. Deliberately narrow:
+   one provider, one attempt, and a hard failure carrying the installer's
+   stderr, because the alternative is an `ImportError` several minutes into a
+   run. `anthropic` is pinned `>=0.102,<2` to keep the `extra_body` workaround
+   in deviation #18 valid. Every cold run pays a network install; a package
+   index outage fails it. Adding the three SDKs to the base image would remove
+   this entirely.
 
 5. **No LLM deliverable matcher.** Upstream's file matcher has a fourth stage
    that asks an LLM which output file corresponds to an expected deliverable
@@ -444,24 +517,27 @@ something different, and why:
 
 9. **No `temperature` on the OpenAI judge path.**
    The original benchmark implementation sends `0.0` to both judges. ModelProxy rejects the parameter outright for gpt-5.x (`400: not supported with this model`), so the OpenAI judge omits it. The consequence is worth stating plainly: that judge is not temperature-pinned and so may not be deterministic
-   run to run. Anthropic judges still send a temperature of `0.0`.
+   run to run. Anthropic and Google judges still send a temperature of `0.0`.
 
 10. **Judge model ids are sent verbatim.**
-    The provider is inferred the way `adapters/__init__.py` infers it, but the prefix is _not_ stripped: `openai/gpt-5.5` is routed to `/openapi` and sent as `openai/gpt-5.5`. That keeps both default judge ids — `claude-sonnet-4-6` and `gpt-5.5`, bare as upstream spells them — literal byte-for-byte no-ops, and avoids depending on how each route happens to treat a prefixed id. `split_model_name`'s stripping return contract is the one thing in that module deliberately not ported from the original implementation.
+    The provider is inferred the way `adapters/__init__.py` infers it, but the prefix is _not_ stripped: `openai/gpt-5.5` selects the OpenAI judge and is sent as the model id `openai/gpt-5.5`. That keeps both default judge ids — `claude-sonnet-4-6` and `gpt-5.5`, bare as upstream spells them — literal byte-for-byte no-ops, and avoids depending on how each endpoint happens to treat a prefixed id. `split_model_name`'s stripping return contract is the one thing in that module deliberately not ported from the original implementation. Upstream's own `_detect_provider` is likewise not vendored: it is prefix-*less* and rejects `anthropic/claude-sonnet-4-6` outright, which is exactly the spelling ModelProxy wants.
 
 11. **OpenAI agent adapter changes.**
     The OpenAI adapter uses Responses rather than Chat Completions because
     it is the current surface for the gpt-5 family and because `judge.py`
     already speaks it, keeping the port to one OpenAI dialect.
 
-12. **Google routes to `/genai`, and authenticates differently.**
-    ModelProxy exposes both `/gemini` and `/genai`. `/gemini` answers `405` to
-    every POST — it is the base URL handed to the `gemini-cli` agent, not a
-    live API surface — so the adapter uses `/genai`, which serves the Gemini
-    API proper. That route also rejects `Authorization: Bearer` with a `401`
-    and requires `x-goog-api-key`. It is the only route in the port that does
-    not use bearer auth, and the only one carrying the model id in the URL path
-    rather than the body.
+12. **The Google credential names are bridged in two places.**
+    The Kaggle entrypoint exports `GOOGLE_GENERATIVE_AI_API_KEY` and
+    `GOOGLE_BASE_URL`; the `google-genai` SDK reads `GOOGLE_API_KEY` /
+    `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL`. Neither set is a superset of
+    the other, so leaving the SDK to its own lookup finds nothing on Kaggle.
+    Both spellings are therefore accepted and the values are passed to the
+    client explicitly. The agent gets this for free from harbor's `PROVIDERS`
+    table via `resolve_model_connection`; the judge cannot import harbor
+    (Harbor uploads `tests/` into the container standalone), so it repeats the
+    bridge in one place, `judge.py::_env`. Two copies of one fact, kept
+    deliberately small and cross-referenced rather than shared.
 
 13. **No `temperature` on the OpenAI agent path.** The agent-side mirror of
     deviation #9: ModelProxy rejects the parameter for gpt-5.x
@@ -483,6 +559,10 @@ something different, and why:
     candidate with a retryable finish reason as a retryable response and
     re-sends. Retries are bounded by `max_retries`; exhausting them raises.
 
+    This is also why the Google adapter drives `client.models.generate_content`
+    rather than `client.chats`, and why every adapter here is stateless where
+    upstream's OpenAI and Google adapters are not — see deviation #20.
+
 15. **Nuances with OpenAI models w/reasoning across turns.**
     ModelProxy rejects `store: true` outright with `400 invalid_prompt`
     ("store is not supported"); it accepts `store: false`, but replay works
@@ -492,18 +572,32 @@ something different, and why:
     prompt and 0-in-3 on another — so a transcript with no reasoning is normal
     and is not evidence that replay has regressed.
 
-16. **Context overflow is only detected on the Anthropic path.**
-    `loop.py` scores a context overflow as a legitimate run outcome by
-    string-matching the provider's error. Neither new route produces an
-    unambiguous marker: OpenAI answered a ~1M-token request with a generic
-    `500 server_error` (it accepted ~805k fine), and Google answered with a
-    bare `503 "model is currently unavailable"`. Both statuses are already in
-    the retry ladder and are indistinguishable from a transient backend fault,
-    so no marker was added rather than guessing. The practical effect is that
-    an OpenAI or Google run that genuinely overflows will burn its retries and
-    surface as a hard failure instead of a scored partial run. Given LAB's
-    document sizes against these models' context windows, this is a remote
-    case, but it is a real gap.
+16. **Context overflow is detected by matching error text, on all four paths.**
+    `loop.py` scores a context overflow as a legitimate run outcome — the run
+    is graded on whatever was produced up to that point — and the only way to
+    recognize one is the wording of the provider's `400`. Upstream matches two
+    markers, which is all it needs; it never ran Gemini or Grok far enough to
+    overflow. `_OVERFLOW_MARKERS` carries five, each quoted from a response
+    measured by deliberately oversizing a request against every provider this
+    port supports:
+
+    | Provider  | Marker text                                                  |
+    | --------- | ------------------------------------------------------------ |
+    | Anthropic | `prompt is too long: 2500577 tokens > 1000000 maximum`         |
+    | OpenAI    | `context_length_exceeded` / `exceeds the context window`       |
+    | Google    | `input token count exceeds the maximum number of tokens`       |
+    | xAI       | `This model's maximum prompt length is 500000 but …`           |
+
+    Matching on text is unlovely, but the distinction is not in the status code
+    or the exception type — every one of these is a plain `400` — and getting
+    it wrong turns a run that should be scored on its partial output into a
+    hard failure. Verified to match on all four and *not* to match a `429` or a
+    `401`. An earlier revision of this port reported no usable marker for
+    OpenAI and Google; that measurement was taken against a generic `500`/`503`
+    from a request that had failed for a different reason, and is superseded.
+    (The OpenAI Responses API additionally caps any single string at
+    10,485,760 characters, which fires before the context error — an oversize
+    probe has to be split across several messages to reach the real one.)
 
 17. **Google `output_tokens` under-reports thinking.**
     Gemini reports thinking tokens in `thoughtsTokenCount`, separately from
@@ -517,6 +611,93 @@ something different, and why:
     `output_tokens` and `context.n_output_tokens` on this path as an
     upstream-comparable metric, not a cost estimate. Nothing the model sees is
     affected. This was filed to upstream at https://github.com/harveyai/harvey-labs/issues/144
+
+18. **Anthropic's `temperature` travels in `extra_body`.**
+    The `anthropic` SDK removed `temperature` from `Messages.create`/`.stream`
+    in 1.0.0 — verified by signature introspection. Upstream's venv is pinned
+    at 0.88.0, so upstream passes it as an ordinary kwarg and never sees this;
+    here `uv pip install anthropic` resolves 1.x, where that same kwarg is a
+    `TypeError`. Both adapter and judge send it in `extra_body` instead, merged
+    into one dict alongside `output_config` when thinking is on. The wire
+    request is unchanged; only the call signature is. The `<2` half of the
+    version pin in deviation #4 exists to make a future 2.x that moves things
+    again fail at resolve time rather than mid-run.
+
+    The same version split has a second, nastier edge: anthropic 1.0.0 is built
+    on **`httpx2`**, a distinct distribution rather than an upgrade of `httpx`,
+    and both end up installed side by side in harbor's venv. An `httpx.Timeout`
+    handed to an httpx2 client is not rejected at the boundary — it travels all
+    the way down to `socket.settimeout` and dies there with
+    `TypeError: 'Timeout' object cannot be interpreted as an integer`, which the
+    SDK wraps as a bare `APIConnectionError: Connection error.` The symptom
+    reads exactly like an unreachable endpoint. Every client here therefore
+    takes its timeout class off its own SDK — `anthropic.Timeout`,
+    `openai.Timeout` — which is correct on both sides of the split, since the
+    older versions re-export httpx's.
+
+19. **Upstream's Gemini thinking config is a silent no-op; the real one is
+    used.** Upstream enables thinking by assigning
+    `config._raw_data["thinking_config"] = …`. `GenerateContentConfig` is a
+    pydantic model with no `_raw_data` field, so that write goes nowhere,
+    `model_dump` never sees it, and thinking is in fact *off* on every upstream
+    Gemini run. This port sets the real `types.ThinkingConfig`, so a
+    `LAB_REASONING_EFFORT` run on Gemini actually thinks. That makes Gemini
+    thinking runs a deliberate divergence from upstream's effective behavior
+    rather than from its intent — non-thinking Gemini runs are unaffected.
+
+20. **The adapters are stateless; two of upstream's are not.**
+    `loop.py` passes the entire message list on every call and separately
+    appends whatever `make_tool_result_messages` returns. Upstream's OpenAI
+    adapter reads `messages` only on the first call and accumulates into
+    `self._context`, and its Google adapter reads only `messages[-1]` after
+    turn one — both correct against upstream's driver, which hands them one
+    turn at a time, and both a double-count against this one. Vendoring that
+    statefulness would have been the literal port and the wrong one. The Google
+    case is the sharper of the two: `chats.Chat` runs each reply through
+    `_extract_curated_history`, which on a response with no parts discards the
+    *preceding user turn* along with the bad model turn — so a
+    `MALFORMED_FUNCTION_CALL` would silently drop the tool result before it,
+    which is precisely what deviation #14 exists to prevent.
+
+21. **`tool_config` is not sent on the Google path.**
+    Upstream sends `ToolConfig(include_server_side_tool_invocations=True)`.
+    That flag concerns tools the backend runs itself, of which this harness has
+    none, and sending it makes `gemini-3.6-flash` answer
+    `503 "The requested model is currently unavailable."` — a message that
+    reads like an outage and is really parameter rejection. The difference is
+    per-model: `gemini-3.1-pro-preview` accepts it. Omitting it works
+    everywhere and changes nothing about the six declared functions.
+
+22. **The judge deep-copies the verdict schema before each Gemini call.**
+    On `google-genai` 1.70 the SDK's schema transformer edits the dict it is
+    handed in place, appending a `property_ordering` key. `_VERDICT_SCHEMA` is
+    one module-level dict shared by all three judges, and Anthropic rejects
+    that key outright (`400 … property_ordering is not supported`) — so in dual
+    mode a Google judge would poison its partner as soon as it made the first
+    call. Ordering-dependent, and therefore invisible to any single-judge run.
+    2.19 no longer mutates, but the dependency pin is a floor and both versions
+    resolve under it. The judge also
+    hands its SDKs a 5-retry ladder rather than the vendor default of 1–2:
+    `JUDGE_PARALLEL` puts eight criteria in flight per model, and a throttled
+    endpoint will return a `429` somewhere in a rubric this size. An exhausted
+    ladder is not a soft failure — it scores that criterion as an error.
+
+23. **Automatic function calling is disabled on both Google paths.**
+    Left unset, `models.generate_content` takes the SDK's
+    automatic-function-calling branch — the one for tools declared as Python
+    callables that the SDK invokes on your behalf. Ours are plain declarations
+    that `loop.py` executes, so the branch finds no function map and breaks out
+    on its first pass. Behaviourally a no-op, but not before it logs
+    `Direct use of automatic function calling (AFC) in
+    Models.generate_content is not recommended…`. In the agent that is noise in
+    the trial log; in the judge — which declares no tools whatsoever, and still
+    trips the warning, because the branch logs before it looks for a function
+    map — it lands in the verifier's stdout, interleaved with the per-criterion
+    pass/fail report a human reads. Passing
+    `AutomaticFunctionCallingConfig(disable=True)` silences it. The setting is
+    client-side only: no request converter serializes the field, so the wire
+    payload is byte-identical either way. Verified on both `google-genai`
+    1.70 and 2.19 (the pin is a floor, and the image resolves the latter).
 
 Note that shell commands are still wrapped exactly as upstream wraps them —
 `timeout --kill-after=2 <n> bash -lc …`, with `WORKSPACE_DIR`, `DOCUMENTS_DIR`,
@@ -542,9 +723,49 @@ collar) — `dual_all_pass_rate` `0.0`, `dual_criterion_pass` `0.9474`,
 `all_pass_strict` `0`, `n_judge_errors` `0`. No disagreement to average: the
 two models agree criterion-for-criterion on upstream's reference answer.
 
+That figure is the port's regression gate, and it survived the move onto the
+vendor SDKs unchanged. Re-grading the same deliverable across every judge
+configuration reproduces it exactly — `claude-sonnet-4-6`, `gpt-5.5`, and
+`gemini-3.6-flash` each single, then `claude-sonnet-4-6 + gpt-5.5` and
+`anthropic/claude-sonnet-4-6 + google/gemini-3.6-flash` dual: 36/38 every time,
+the same two criteria, `n_judge_errors` `0`, `dual_criterion_pass` `0.9474`.
+Verdict drift here would mean a request body changed.
+
 A full Harbor trial on this task — agent phase included, so a freshly written
 deliverable — reproduces those aggregates exactly, with
 the same two criteria failing under both judges.
+
+The agent side was checked the same way, one live trial per provider through
+`run-local-datasets.sh` against the Kaggle image, so every credential and base
+URL came from the entrypoint rather than from anything in this repo:
+
+| Model | Turns | Tokens | Deliverable | Notes |
+|---|---|---|---|---|
+| `anthropic/claude-sonnet-4-6` | 11 | 615k | yes | runtime `anthropic` install; 36/38, the reference figure |
+| `openai/gpt-5.6-sol` | 7 | 226k | yes | wrote via shell rather than the `write` tool |
+| `google/gemini-3.6-flash` | 13 | 669k | yes | runtime `google-genai` install |
+| `google/gemini-3.1-pro-preview` | 13 | 530k | yes | `LAB_REASONING_EFFORT=high` |
+| `xai/grok-4.5` | 7 | 291k | yes | 38/38 under both judges; `provider=openai` |
+
+Each logged its connection as `base_url=https://mp-staging.kaggle.net/models/…`
+— inherited from the environment, never constructed. Scores vary by model and
+are not the assertion here; a clean finish, a real tool-using trajectory, and a
+graded deliverable are.
+
+Thinking was confirmed on rather than assumed. Asking
+`gemini-3.1-pro-preview` for a `ThinkingConfig` with `include_thoughts=True`
+returns an actual thought part, which can only happen if the config reached the
+wire — the direct check that deviation #19's `_raw_data` hack would fail.
+
+Finally, that no code here builds a ModelProxy URL was proven by making the
+environment lie. Running each provider under plain `harbor run` with
+`--ae *_BASE_URL=http://127.0.0.1:9/…`, all three failed against
+`127.0.0.1:9`, with no `mp-*` or vendor host anywhere in the trial log.
+Success — or a failure naming some other host — would have meant something was
+still assembling the URL itself. Note that the override variable is the one
+harbor's `PROVIDERS` table reads, which for Google is `GOOGLE_BASE_URL`, not
+the SDK-native `GOOGLE_GEMINI_BASE_URL`; `--ae` only reaches the resolver, so
+the SDK-native spelling falls through to the vendor default.
 
 Note: `claude-haiku-4-5` scores `0.0`: it writes a well-formed report to a literal `/output/` instead of `$OUTPUT_DIR`, and a deliverable outside the output directory is graded as missing. That is the original benchmark's behavior too — upstream bind-mounts only `output_dir` to `/workspace/output` and grades the host side of that mount, so a write to `/output` is equally invisible there.
 
@@ -556,16 +777,22 @@ that — the agent phase runs `network_mode = "no-network"`. The agent loop
 itself is unaffected because it runs on the host, not in the container.
 
 The verifier is the exception: its judge runs in-container and needs egress to
-ModelProxy, so the verifier phase switches to an allowlist. Harbor's Linux
+a model API, so the verifier phase switches to an allowlist. Harbor's Linux
 Docker environment supports per-phase network policy, so the agent phase stays
 sealed.
 
-That allowlist is deliberately just the two ModelProxy hosts — staging and
-prod, so the task runs unmodified against either. Every dependency the judge
-imports is baked into the image, so it runs on the system interpreter and
-installs nothing at verify time. If you add a dependency to `judge.py`, add it
-to the `Dockerfile` rather than widening the allowlist to reach a package
-index.
+That allowlist is deliberately five hosts: the three vendor API endpoints the
+SDKs dial by default, plus the two ModelProxy hosts — staging and prod — that
+they dial instead when the `*_BASE_URL` variables point there, as they do on
+Kaggle. A superset rather than a choice between the two, because the same
+`task.toml` has to grade correctly in both environments and only the
+environment knows which applies. Whichever it is, the unused entries are simply
+never dialled.
+
+Every dependency the judge imports is baked into the image, so it runs on the
+system interpreter and installs nothing at verify time. If you add a dependency
+to `judge.py`, add it to the `Dockerfile` rather than widening the allowlist to
+reach a package index.
 
 ## Adding tasks
 

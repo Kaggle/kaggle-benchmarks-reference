@@ -25,6 +25,31 @@ is exhausted.
 import json
 import time
 
+# Substrings that identify a context overflow in a provider's 400. Each is
+# quoted from a real response, measured by oversizing a request against every
+# provider this port supports:
+#
+#   anthropic  "prompt is too long: 2500577 tokens > 1000000 maximum"
+#   openai     code "context_length_exceeded", "Your input exceeds the
+#              context window of this model."
+#   google     "The input token count exceeds the maximum number of tokens
+#              allowed 1048576."
+#   xai        "This model's maximum prompt length is 500000 but the request
+#              contains 1600582 tokens."
+#
+# Upstream matches only the first two, which is all it needs: it never ran
+# Gemini or Grok far enough to overflow. Matching on text is unlovely, but the
+# distinction is not in the status code or the exception type -- every one of
+# these is a plain 400 -- and getting it wrong turns a run that should be
+# scored on its partial output into a hard failure.
+_OVERFLOW_MARKERS = (
+    "prompt is too long",
+    "context_length_exceeded",
+    "exceeds the context window",
+    "input token count exceeds the maximum",
+    "maximum prompt length is",
+)
+
 
 def run_agent(
     adapter,
@@ -67,10 +92,7 @@ def run_agent(
                 # failure: the run is scored on whatever was produced up to
                 # that point. Anything else propagates.
                 err_msg = str(e)
-                if (
-                    "prompt is too long" in err_msg
-                    or "context_length_exceeded" in err_msg
-                ):
+                if any(marker in err_msg for marker in _OVERFLOW_MARKERS):
                     context_overflow = True
                     break
                 raise

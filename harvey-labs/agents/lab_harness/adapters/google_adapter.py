@@ -12,33 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Google Gemini adapter, routed through Kaggle's ModelProxy's /genai path.
+"""Google Gemini adapter.
 
-The harness contract is preserved: the same six tools with the same schemas,
-the same system prompt, and a loop that ends when the model stops calling tools.
+Ported from harvey-labs harness/adapters/google.py (MIT, (c) 2026 Harvey AI).
 
-Two things about this route differ from others:
+Uses the ``google-genai`` SDK against whatever base URL the environment
+supplies. Nothing here knows about Kaggle's ModelProxy: on Kaggle the Harbor
+entrypoint exports a Gemini key and base URL pointing at the proxy, and off
+Kaggle the SDK's own defaults reach generativelanguage.googleapis.com. The
+caller resolves both and passes them in.
 
-1. It authenticates with ``x-goog-api-key``, not ``Authorization: Bearer``.
-   Sending a bearer token returns 401. This is the only route in the port that
-   does not use bearer auth.
+Note that the entrypoint spells those variables ``GOOGLE_GENERATIVE_AI_API_KEY``
+and ``GOOGLE_BASE_URL`` while the SDK reads ``GOOGLE_API_KEY``/``GEMINI_API_KEY``
+and ``GOOGLE_GEMINI_BASE_URL``. Nothing is bridged here -- ``agent.py`` resolves
+both through harbor's ``resolve_model_connection``, whose provider table already
+knows every spelling, and hands the values in explicitly.
 
-2. The model id goes in the URL path (``/v1beta/models/<model>:generateContent``)
-   rather than in the request body.
+Two divergences from upstream that must not be "synced back":
 
-The transport is ``httpx`` rather than ``google-genai`` for the same reason as
-the other adapters: this agent runs in Harbor's executor process and cannot
-add dependencies to it.
+1. Upstream builds its thinking config by assigning
+   ``config._raw_data["thinking_config"]``. ``GenerateContentConfig`` is a
+   pydantic model with no ``_raw_data`` field, so that write is a silent no-op
+   and thinking never gets enabled. The real ``types.ThinkingConfig`` is used
+   here instead.
+
+2. Upstream drives ``client.chats``, which keeps the conversation server-side.
+   This adapter is stateless and calls ``client.models.generate_content`` with
+   the full history every turn -- see ``chat`` for why that matters for the
+   MALFORMED_FUNCTION_CALL retry.
 """
 
 import json
-import time
 
-import httpx
+from google import genai
+from google.genai import types
 
 from .base import ModelAdapter, ModelResponse, ToolCall
-
-API_VERSION = "v1beta"
 
 # Thinking levels Gemini 3.x accepts, mirroring upstream's THINKING_LEVEL_MAP.
 # Anything outside this set is dropped rather than passed through: `run.py`
@@ -48,15 +57,17 @@ API_VERSION = "v1beta"
 THINKING_LEVELS = frozenset({"minimal", "low", "medium", "high"})
 
 # Statuses worth another attempt: rate limits, overload, and transient 5xx.
-# Same set as the Anthropic adapter and the judge.
-_RETRY_STATUSES = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
+# Same set as the Anthropic adapter and the judge. Handed to the SDK, which
+# owns the backoff; the loop below only retries the empty-candidate case the
+# SDK cannot see.
+_RETRY_STATUSES = (408, 409, 429, 500, 502, 503, 504, 529)
 
 # Finish reasons that arrive as a 200 but carry no usable candidate, and that
 # a retry can plausibly fix. MALFORMED_FUNCTION_CALL is the one that matters:
 # the model tried to call a tool and produced tool-call JSON the backend could
-# not parse, so it returns `{"content": {"role": "model"}}` with no parts at
-# all. Measured at roughly 3-in-10 on gemini-3.1-pro-preview against the six
-# LAB tools; the other Gemini models hit it far more rarely.
+# not parse, so it returns `{"role": "model"}` with no parts at all. Measured
+# at roughly 3-in-10 on gemini-3.1-pro-preview against the six LAB tools; the
+# other Gemini models hit it far more rarely.
 #
 # This has to be retried inside the adapter rather than surfaced. The turn has
 # no content to append, and appending an empty `{"role": "model"}` to history
@@ -66,20 +77,16 @@ _RETRY_FINISH_REASONS = frozenset({"MALFORMED_FUNCTION_CALL"})
 
 
 class GoogleAPIError(RuntimeError):
-    """A non-retryable error returned by the Gemini API.
+    """A 200 response that carried nothing usable.
 
-    The message embeds the API's own error text so the agent loop can inspect
-    it, the way it does for the other providers.
+    Transport and status errors surface as the SDK's own ``errors.APIError``
+    subclasses, which already embed the API's error text for the agent loop to
+    inspect. This covers only the cases the SDK considers successful.
     """
-
-    def __init__(self, status_code: int, body: str):
-        self.status_code = status_code
-        self.body = body
-        super().__init__(f"Google API error {status_code}: {body}")
 
 
 class GoogleAdapter(ModelAdapter):
-    """Adapter for Google's Gemini models via ModelProxy's /genai route."""
+    """Adapter for Google's Gemini models."""
 
     # Max output tokens per model family. Gemini 3.x tops out at 64k output.
     MAX_OUTPUT = {
@@ -89,8 +96,8 @@ class GoogleAdapter(ModelAdapter):
     def __init__(
         self,
         model: str,
-        base_url: str,
-        api_key: str,
+        api_key: str | None = None,
+        base_url: str | None = None,
         temperature: float = 0.0,
         max_tokens: int | None = None,
         reasoning_effort: str | None = None,
@@ -103,17 +110,22 @@ class GoogleAdapter(ModelAdapter):
                 65536,
             )
         self.max_tokens = max_tokens
-        self.base_url = base_url.rstrip("/")
         self.max_retries = max_retries
-        self.client = httpx.Client(
-            base_url=self.base_url,
-            headers={
-                # This route rejects `Authorization: Bearer` with a 401; the
-                # proxy key goes in the Gemini API's own header instead.
-                "x-goog-api-key": api_key,
-                "content-type": "application/json",
-            },
-            timeout=httpx.Timeout(connect=30.0, read=900.0, write=120.0, pool=30.0),
+        self.client = genai.Client(
+            # None lets the SDK fall back to its own env lookup / default.
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                base_url=base_url,
+                # Milliseconds, unlike every other SDK here. Generous: a
+                # thinking model can be quiet for a long while.
+                timeout=900_000,
+                retry_options=types.HttpRetryOptions(
+                    # attempts counts the initial call, so this is
+                    # max_retries retries.
+                    attempts=max_retries + 1,
+                    http_status_codes=list(_RETRY_STATUSES),
+                ),
+            ),
         )
         self._system_instruction: str | None = None
         # functionResponse is keyed by tool *name*, but the loop hands back
@@ -131,136 +143,159 @@ class GoogleAdapter(ModelAdapter):
             else:
                 contents.append(self._to_content(msg))
 
-        generation_config: dict = {
-            "temperature": self.temperature,
-            "maxOutputTokens": self.max_tokens,
-        }
+        config = types.GenerateContentConfig(
+            temperature=self.temperature,
+            max_output_tokens=self.max_tokens,
+            system_instruction=self._system_instruction or None,
+            tools=[
+                types.Tool(
+                    function_declarations=[self._translate_tool(t) for t in tools]
+                )
+            ],
+            # No `tool_config`. Upstream sends
+            # `ToolConfig(include_server_side_tool_invocations=True)`; that
+            # flag concerns tools the backend runs itself, which this harness
+            # has none of, and sending it makes gemini-3.6-flash answer
+            # 503 "The requested model is currently unavailable" -- a message
+            # that reads like an outage and is really parameter rejection.
+            # gemini-3.1-pro-preview accepts it, so the difference is
+            # per-model. Omitting it works everywhere and changes nothing
+            # about the six declared functions. Please don't "sync" it back.
+            #
+            # AFC off. Left unset, `generate_content` takes the SDK's
+            # automatic-function-calling path, which is for tools declared as
+            # Python callables the SDK invokes itself. Ours are plain
+            # declarations executed by loop.py, so that path finds nothing to
+            # call and breaks out on its first pass -- but not before logging
+            # "Direct use of automatic function calling (AFC) in
+            # Models.generate_content is not recommended", which lands in the
+            # trial log looking like a defect. Disabling it is client-side
+            # only: no converter serializes this field, so the request body is
+            # byte-identical either way.
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                disable=True
+            ),
+        )
         if self.reasoning_effort in THINKING_LEVELS:
             # Gemini 3 takes a named thinking level rather than a token budget.
-            # `includeThoughts` asks for the thought parts back; they are
+            # `include_thoughts` asks for the thought parts back; they are
             # replayed into history verbatim next turn and filtered out of
             # `text` below, so they inform the model without reaching the
             # deliverable.
-            generation_config["thinkingConfig"] = {
-                "thinkingLevel": self.reasoning_effort.upper(),
-                "includeThoughts": True,
-            }
+            config.thinking_config = types.ThinkingConfig(
+                thinking_level=self.reasoning_effort.upper(),
+                include_thoughts=True,
+            )
 
-        payload = {
-            "contents": contents,
-            "tools": [
-                {"functionDeclarations": [self._translate_tool(t) for t in tools]}
-            ],
-            "generationConfig": generation_config,
-        }
-        if self._system_instruction:
-            payload["systemInstruction"] = {
-                "parts": [{"text": self._system_instruction}]
-            }
-
-        response, content = self._generate(payload)
-        parts = content.get("parts") or []
+        response, content = self._generate(contents, config)
 
         tool_calls = []
         text_parts = []
-        for part in parts:
-            if "functionCall" in part:
-                call = part["functionCall"]
-                name = call.get("name", "")
+        for part in content.parts or []:
+            if part.function_call is not None:
+                call = part.function_call
+                name = call.name or ""
                 # Gemini does not always return an id; synthesize a stable one
                 # so the loop's (id -> result) bookkeeping still works.
-                call_id = call.get("id") or f"{name}-{len(tool_calls)}"
+                call_id = call.id or f"{name}-{len(tool_calls)}"
                 self._call_names[call_id] = name
                 tool_calls.append(
                     ToolCall(
                         id=call_id,
                         name=name,
-                        arguments=json.dumps(call.get("args") or {}),
+                        arguments=json.dumps(dict(call.args or {})),
                     )
                 )
-            elif "text" in part and not part.get("thought"):
+            elif part.text and not part.thought:
                 # Thought parts carry `thought: true` and are the model's
                 # reasoning, not its answer. They stay in `message` so they
                 # replay next turn, but must not reach `text` -- that is what
                 # the loop logs and what the run's final answer is read from.
-                text_parts.append(part["text"])
+                text_parts.append(part.text)
 
-        usage = response.get("usageMetadata", {}) or {}
+        usage = response.usage_metadata
 
         return ModelResponse(
-            # Echoed back verbatim next turn, thoughtSignature parts included.
+            # Echoed back verbatim next turn, thought_signature parts included.
             # Gemini returns a signature on nearly every turn and replaying it
             # is what preserves its reasoning across the run -- the same
             # discipline as the Anthropic adapter's thinking signatures.
-            message=content,
+            #
+            # Dumped to a plain dict in JSON mode rather than kept as a
+            # `types.Content`: history is written to a transcript, and a
+            # signature is `bytes`, which is not JSON-serializable. JSON mode
+            # base64-encodes it, and the SDK decodes that spelling back to the
+            # same bytes on the way in -- verified round trip.
+            message=content.model_dump(exclude_none=True, mode="json"),
             tool_calls=tool_calls,
             text="\n".join(text_parts),
-            input_tokens=usage.get("promptTokenCount", 0),
-            # `candidatesTokenCount` only, matching upstream.
-            # This under-reports actual spend. See https://github.com/harveyai/harvey-labs/issues/144
-            output_tokens=usage.get("candidatesTokenCount", 0),
+            input_tokens=(usage.prompt_token_count or 0) if usage else 0,
+            # `candidates_token_count` only, matching upstream. This
+            # under-reports actual spend -- thinking tokens are counted
+            # separately and are not included. See
+            # https://github.com/harveyai/harvey-labs/issues/144
+            output_tokens=(usage.candidates_token_count or 0) if usage else 0,
         )
 
     # -- Transport --------------------------------------------------------
 
-    def _generate(self, payload: dict) -> tuple[dict, dict]:
-        """POST :generateContent, returning (response, candidate content).
+    def _generate(self, contents: list, config) -> tuple[object, types.Content]:
+        """Call generate_content, returning (response, candidate content).
 
-        Retries transport errors and retryable statuses like the other
-        adapters, and additionally retries a 200 whose candidate came back
-        empty because the model emitted an unparseable tool call. See
-        _RETRY_FINISH_REASONS for why that one cannot be left to the caller.
+        `client.models.generate_content` rather than `client.chats`: the loop
+        owns the history and passes all of it every turn, so a stateful chat
+        session would double-count it. There is a sharper reason too --
+        `chats.Chat` runs each reply through `_extract_curated_history`, which
+        on a response with no parts discards the *preceding user turn* along
+        with the bad model turn. A MALFORMED_FUNCTION_CALL would therefore
+        silently drop the tool result that preceded it, which is exactly what
+        the retry below exists to prevent.
+
+        The SDK owns the HTTP retry ladder (see HttpRetryOptions above). This
+        loop adds the one case it cannot see: a 200 whose candidate came back
+        empty because the model emitted an unparseable tool call.
         """
-        # The model id is part of the path here, not the body.
-        endpoint = f"/{API_VERSION}/models/{self.model}:generateContent"
         last_error: Exception | None = None
 
-        for attempt in range(self.max_retries + 1):
-            try:
-                response = self.client.post(endpoint, json=payload)
-                if response.status_code == 200:
-                    body = response.json()
-                    content, err = self._candidate(body)
-                    if content is not None:
-                        return body, content
-                    last_error = err
-                elif response.status_code not in _RETRY_STATUSES:
-                    raise GoogleAPIError(response.status_code, response.text)
-                else:
-                    last_error = GoogleAPIError(response.status_code, response.text)
-            except (httpx.TransportError, httpx.StreamError) as e:
-                last_error = e
-
-            if attempt < self.max_retries:
-                time.sleep(min(2**attempt, 8))
+        for _ in range(self.max_retries + 1):
+            response = self.client.models.generate_content(
+                model=self.model, contents=contents, config=config
+            )
+            content, err = self._candidate(response)
+            if content is not None:
+                return response, content
+            last_error = err
 
         raise last_error if last_error else RuntimeError("request failed")
 
     @staticmethod
-    def _candidate(body: dict) -> tuple[dict | None, Exception | None]:
-        """Pull the usable candidate content out of a 200 response.
+    def _candidate(response) -> tuple[types.Content | None, Exception | None]:
+        """Pull the usable candidate content out of a response.
 
         Returns (content, None) on success, or (None, error) when the turn
         produced nothing usable. A non-retryable cause is raised immediately;
         a retryable one is handed back for the ladder to sit on.
         """
-        candidates = body.get("candidates") or []
+        candidates = response.candidates or []
         if not candidates:
             # A prompt blocked by safety filters comes back with no candidate
-            # and a promptFeedback explaining why. Not retryable.
-            feedback = body.get("promptFeedback") or {}
-            raise GoogleAPIError(200, f"no candidates returned: {json.dumps(feedback)}")
+            # and a prompt_feedback explaining why. Not retryable.
+            raise GoogleAPIError(
+                f"no candidates returned: {response.prompt_feedback}"
+            )
 
         candidate = candidates[0]
-        content = candidate.get("content") or {}
-        if content.get("parts"):
+        content = candidate.content
+        if content is not None and content.parts:
             return content, None
 
-        reason = candidate.get("finishReason", "unknown")
+        reason = candidate.finish_reason
+        # An enum on the way out; compare and report by name.
+        reason_name = getattr(reason, "name", None) or str(reason or "unknown")
         error = GoogleAPIError(
-            200, f"empty candidate content (finishReason={reason})"
+            f"empty candidate content (finish_reason={reason_name})"
         )
-        if reason in _RETRY_FINISH_REASONS:
+        if reason_name in _RETRY_FINISH_REASONS:
             return None, error
         raise error
 
@@ -271,13 +306,18 @@ class GoogleAdapter(ModelAdapter):
         """Normalize a history entry into a Gemini `contents` entry.
 
         Assistant turns are already stored in native form (the candidate's
-        content dict, echoed verbatim); user turns arrive from
-        make_user_message in the same shape. Anything still carrying a plain
-        string `content` is wrapped.
+        content, dumped verbatim); user turns arrive from make_user_message in
+        the same shape. Anything still carrying a plain string `content` is
+        wrapped. Dicts are handed to the SDK as-is -- it validates them into
+        `types.Content` itself, including the base64 `thoughtSignature`
+        spelling produced by the dump in `chat`.
         """
         if "parts" in msg:
             return msg
-        return {"role": msg.get("role", "user"), "parts": [{"text": msg.get("content", "")}]}
+        return {
+            "role": msg.get("role", "user"),
+            "parts": [{"text": msg.get("content", "")}],
+        }
 
     def make_tool_result_messages(self, results: list[tuple[str, str]]) -> list[dict]:
         # Like Anthropic, Gemini takes all results for a turn in one message.
@@ -304,10 +344,10 @@ class GoogleAdapter(ModelAdapter):
     def make_user_message(self, content: str) -> dict:
         return {"role": "user", "parts": [{"text": content}]}
 
-    def _translate_tool(self, tool: dict) -> dict:
+    def _translate_tool(self, tool: dict) -> types.FunctionDeclaration:
         """Translate a canonical tool definition to a Gemini declaration."""
-        return {
-            "name": tool["name"],
-            "description": tool["description"],
-            "parameters": tool["parameters"],
-        }
+        return types.FunctionDeclaration(
+            name=tool["name"],
+            description=tool["description"],
+            parameters=tool["parameters"],
+        )
