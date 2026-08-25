@@ -26,22 +26,33 @@ only the parts that shape what the model sees:
 These invariants are held to ensure scores are comparable to the reference
 benchmark implementation.
 
-The agent calls Kaggle's ModelProxy at MODEL_PROXY_BASE_URL, using credentials
-at MODEL_PROXY_API_KEY. This is instead of calling model specific APIs. Kaggle's
-Harbor entrypoint only translates the shared proxy credentials for its
-known built-in agents.
+Models are reached through their own vendor SDKs, at whatever base URL the
+environment supplies. On Kaggle the Harbor entrypoint translates the shared
+ModelProxy credential into the vendors' own key and base-URL variables, so the
+SDKs land on the proxy without anything here knowing about it; off Kaggle the
+same variables point at the real vendors. Credentials are resolved by harbor's
+own `resolve_model_connection`, whose provider table already knows every
+spelling of both.
 """
 
 import asyncio
+import importlib
 import json
+import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 from harbor.agents.base import BaseAgent
+from harbor.agents.model_connection import (
+    PROVIDERS,
+    ModelConnectionSpec,
+    resolve_model_connection,
+)
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
-from .adapters import create_adapter
+from .adapters import PROVIDER_PACKAGES, create_adapter, split_model_name
 from .loop import run_agent
 from .tools import (
     OUTPUT_PATH,
@@ -58,7 +69,23 @@ DEFAULT_MODEL = "anthropic/claude-sonnet-4-6"
 DEFAULT_MAX_TURNS = 200
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_SHELL_TIMEOUT = 60
-DEFAULT_PROXY_BASE_URL = "https://mp-staging.kaggle.net/models"
+
+# Version pins for the runtime SDK install in `setup()`. `anthropic` is capped
+# because the adapter's `extra_body` temperature workaround is written against
+# 1.x's parameter set; a 2.x that moved things again should fail the resolve
+# rather than the run.
+PROVIDER_REQUIREMENTS = {
+    "anthropic": "anthropic>=0.102,<2",
+    "openai": "openai>=2.0",
+    "google-genai": "google-genai>=1.70",
+}
+
+# Providers that borrow another provider's connection. ModelProxy has no xAI
+# route -- Grok is served on the same OpenAI-compatible surface -- and harbor's
+# PROVIDERS["xai"] points at api.x.ai with an XAI_API_KEY the Kaggle entrypoint
+# never populates. Resolving xai as openai picks up the credential that is
+# actually there.
+_CONNECTION_PROVIDER = {"xai": "openai"}
 
 
 def _load_skills(skill_names: list[str]) -> str:
@@ -112,8 +139,55 @@ class LABHarnessAgent(BaseAgent):
             self.logger.warning("Ignoring non-numeric %s=%r", key, raw)
             return default
 
+    def _ensure_sdk(self, model_name: str) -> None:
+        """Import the selected provider's SDK, installing it if it is absent.
+
+        This agent runs in Harbor's executor process, not in the task
+        container. Harbor's uv tool venv ships `openai` but not `anthropic` or
+        `google-genai`, and this repo has no say in that image, so the missing
+        one is installed on demand at setup time -- the agent phase still has
+        network; it is only the task container that is sealed.
+
+        Deliberately narrow: only the provider this run selected, only when the
+        import actually fails, so a warm venv and an openai run both cost
+        nothing. A failure is fatal and carries the installer's stderr, because
+        the alternative is an ImportError several minutes into the run.
+        """
+        provider, _ = split_model_name(model_name)
+        package = PROVIDER_PACKAGES.get(provider)
+        if package is None:
+            return
+        module = package.replace("-", ".")  # google-genai -> google.genai
+
+        try:
+            importlib.import_module(module)
+            return
+        except ImportError:
+            pass
+
+        requirement = PROVIDER_REQUIREMENTS.get(package, package)
+        self.logger.info("Installing %s for provider %s", requirement, provider)
+        result = subprocess.run(
+            ["uv", "pip", "install", "--python", sys.executable, requirement],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Could not install {requirement}, which this agent needs to "
+                f"reach {provider} models:\n{result.stderr.strip()}"
+            )
+
+        # A package installed after the process started is invisible to an
+        # import cache built when its directory did not exist.
+        importlib.invalidate_caches()
+        importlib.import_module(module)
+        self.logger.debug("Installed %s", requirement)
+
     async def setup(self, environment: BaseEnvironment) -> None:
         """Stage the skill scripts and the writable output directory."""
+        await asyncio.to_thread(self._ensure_sdk, self.model_name or DEFAULT_MODEL)
+
         await environment.exec(
             f"mkdir -p {OUTPUT_PATH} {WORKSPACE_PATH}/skills", cwd="/"
         )
@@ -136,22 +210,33 @@ class LABHarnessAgent(BaseAgent):
         context: AgentContext,
     ) -> None:
         model_name = self.model_name or DEFAULT_MODEL
+        provider, _ = split_model_name(model_name)
 
-        api_key = self._get_env("MODEL_PROXY_API_KEY")
-        if not api_key:
-            raise RuntimeError(
-                "MODEL_PROXY_API_KEY is not set. This agent calls models through "
-                "Kaggle's ModelProxy; pass the key with `--ae "
-                "MODEL_PROXY_API_KEY=...` or export it before `harbor run`."
-            )
-        proxy_base_url = (
-            self._get_env("MODEL_PROXY_BASE_URL") or DEFAULT_PROXY_BASE_URL
+        # `default_provider` is passed rather than inferred: the fallback path
+        # imports litellm's get_llm_provider, which is slow, and `xai` has to
+        # be redirected anyway.
+        connection_provider = _CONNECTION_PROVIDER.get(provider, provider)
+        conn = resolve_model_connection(
+            model_name,
+            ModelConnectionSpec(default_provider=connection_provider),
+            self._resolve_env,
         )
-        # The Kaggle runner supplies the proxy root without the /models
-        # segment; both spellings are accepted so the agent works either way.
-        proxy_base_url = proxy_base_url.rstrip("/")
-        if not proxy_base_url.endswith("/models"):
-            proxy_base_url = f"{proxy_base_url}/models"
+        if not conn.api_key:
+            wanted = ", ".join(PROVIDERS[connection_provider].api_key_envs)
+            raise RuntimeError(
+                f"No API key found for {provider} models. Set one of {wanted} "
+                f"-- or, on Kaggle, MODEL_PROXY_API_KEY, which the Harbor "
+                f"entrypoint translates into them."
+            )
+        # `configured_base_url`, not `base_url`: the latter falls back to the
+        # hardcoded vendor URL in harbor's PROVIDERS table. None is what we
+        # want when nothing is configured -- it leaves each SDK to apply its
+        # own default, and keeps a vendor literal out of this repo.
+        self.logger.debug(
+            "Model connection: provider=%s base_url=%s",
+            conn.provider,
+            conn.configured_base_url or "(SDK default)",
+        )
 
         max_turns = self._int_env("LAB_MAX_TURNS", DEFAULT_MAX_TURNS)
         temperature = self._float_env("LAB_TEMPERATURE", DEFAULT_TEMPERATURE)
@@ -161,8 +246,8 @@ class LABHarnessAgent(BaseAgent):
         )
         adapter = create_adapter(
             model_name=model_name,
-            proxy_base_url=proxy_base_url,
-            api_key=api_key,
+            api_key=conn.api_key,
+            base_url=conn.configured_base_url,
             temperature=temperature,
             reasoning_effort=reasoning_effort or None,
         )

@@ -11,8 +11,9 @@ The upstream project is the original source of the benchmark tasks, the agent
 scaffolding, the rubric criteria, and the evaluation methodology. This port
 adapts that work to run on Kaggle via the Harbor framework
 (https://github.com/laude-institute/harbor). Main architectural changes:
-replacing `podman` sandbox with Harbor-managed containers and routing all
-model traffic through Kaggle's ModelProxy instead of vendor APIs.
+replacing `podman` sandbox with Harbor-managed containers, and calling the
+vendor SDKs against whatever base URL the environment supplies -- Kaggle's
+ModelProxy on Kaggle, the vendors themselves elsewhere.
 
 Upstream reference commit: 55510f0e609ffa5cf6f5df17d9a813ce4bb33d0c
 

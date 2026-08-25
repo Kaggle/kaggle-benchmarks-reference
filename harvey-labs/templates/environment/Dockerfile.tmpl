@@ -10,8 +10,11 @@
 #     docker build context is the `environment/` directory. The exception is a
 #     shared-corpus area, which mounts instead; the workspace stanza at the
 #     bottom of this file says which applies here.
-#   - `httpx` is added for the verifier's judge, so it can reach ModelProxy
-#     without installing anything at verify time.
+#   - The three model SDKs are added for the verifier's judge, so it can reach
+#     a model API without installing anything at verify time. All three are
+#     installed unconditionally rather than per-task, because the judge line-up
+#     is chosen at run time by LAB_JUDGE_MODEL(S) and the image is built long
+#     before that. Keep them in lockstep with judge.py's PEP-723 header.
 #
 # Every apt/pip/npm package below is load-bearing: pandoc drives .docx parsing
 # for both the agent's `read` tool and the judge's deliverable extraction, and
@@ -50,12 +53,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \
+        "anthropic>=0.102,<2" \
         defusedxml \
         diff-match-patch \
         docxtpl \
-        httpx \
+        "google-genai>=1.70" \
         lxml \
         markitdown \
+        "openai>=2.0" \
         openpyxl \
         pandas \
         pdf2image \
